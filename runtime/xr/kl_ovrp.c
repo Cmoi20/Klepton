@@ -994,7 +994,7 @@ float kl_ovrp_display_frequency(void) {
 // on device — a frontend pushing UIDevice's real reading. Sanity checks mirror
 // the display-frequency setter: a level outside 0..100 is a bad measurement,
 // and passing it on would make every consumer answer nonsense.
-static int g_battery_level = 95;       // Quest-2 fiction, like the display: 72 Hz
+static int g_battery_level = 95;       // host/unknown fallback; visionOS publishes UIDevice
 static int g_battery_charging;
 
 void kl_ovrp_set_battery_level(int level) {

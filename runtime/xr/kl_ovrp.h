@@ -585,8 +585,8 @@ void kl_ovrp_set_display_frequency(float hz);
 void kl_ovrp_set_forced_hz_hint(float hz);
 
 // Battery telemetry, as one source of truth. The defaults are the Quest-2
-// fiction (95% / not charging) — on the host there is no battery. A visionOS
-// frontend that reads the real level off UIDevice pushes it through
+// fiction (95% / not charging) — on the host there is no battery. The visionOS
+// frontend reads the real level off UIDevice and pushes it through
 // kl_ovrp_set_battery_level, the same seam shape as
 // kl_ovrp_set_display_frequency, and BOTH the OVRPlugin query
 // (ovrp_GetSystemBatteryLevel2) and the Java BatteryManager answer
