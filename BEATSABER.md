@@ -15,10 +15,11 @@ put `main.1716.com.beatgames.beatsaber.obb' to '~/Library/Application Support/Kl
 ```bash
 ./build_run_viewer.sh beatsaber
 ```
-delete `~/Library/Application Support/Klepton/userdata/<target>/beatsaber/files/PlayerData.dat`
-rename`~/Library/Application Support/Klepton/userdata/<target>/beatsaber/files/PlayerData.dat.tmp` to `~/Library/Application Support/Klepton/userdata/<target>/beatsaber/files/PlayerData.dat`
+1. delete `~/Library/Application Support/Klepton/userdata/<target>/beatsaber/files/PlayerData.dat`
+
+2. rename`~/Library/Application Support/Klepton/userdata/<target>/beatsaber/files/PlayerData.dat.tmp` to `~/Library/Application Support/Klepton/userdata/<target>/beatsaber/files/PlayerData.dat`
 ```bash
 ./build_run_vpro.sh  beatsaber # -> return an error in AVP
 KLEPTON_TARGET=beatsaber KLT_STAGE_FILES="files" visionos/stage_assets.sh <target>
 ./build_run_vpro.sh  beatsaber
-```bash
+```
