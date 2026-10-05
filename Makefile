@@ -992,9 +992,10 @@ ovrpabi:
 # checkout ~12 GB, build ~30-60 min.
 .PHONY: angle-debug
 angle-debug: angle-fetch
+	cd vendor && if [ ! -f depot_tools/python3_bin_reldir.txt ]; then cd depot_tools && ./update_depot_tools && cd ..; fi
 	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
-	  gn gen out/Debug --args='is_debug=true target_cpu="arm64" use_lld=false' && \
-	  autoninja -C out/Debug libEGL libGLESv2
+		gn gen out/Debug --args='is_debug=true target_cpu="arm64" use_lld=false' && \
+		autoninja -C out/Debug libEGL libGLESv2
 
 # ---- vendor/ — the ANGLE checkout, which we MODIFY ----
 #
