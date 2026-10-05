@@ -4,10 +4,6 @@ brew install pkg-config sdl3 apktool
 apktool d -f -o beatsaber beatsaber.apk
 make mvk
 make check
-make angle-all # -> error
-cd vendor/depot_tools
-./update_depot_tools
-cd ../..
 make angle-all
 make xros
 ```
