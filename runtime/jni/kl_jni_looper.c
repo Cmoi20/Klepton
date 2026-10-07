@@ -243,7 +243,7 @@ typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t  wake;
     pthread_t       thread;
-    int             running, started;
+    int             running, started, exited, joined;
     void           *q[KLJ_MAX_LOOPER_MSGS];
     unsigned        head, tail, count;
 } klj_looper;
@@ -265,6 +265,7 @@ static void *klj_looper_thread(void *arg) {
         klj_deliver_message(msg);          // outside the lock: it runs guest code
         pthread_mutex_lock(&lp->lock);
     }
+    lp->exited = 1;
     pthread_mutex_unlock(&lp->lock);
     return NULL;
 }
@@ -429,6 +430,20 @@ static klj_val klj_Handler_obtainMessage(void *env, void *self, const klj_val *a
     return (klj_val){.l = obj};
 }
 
+static klj_val klj_Message_getTarget(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_message *m = klj_as_message(self);
+    return (klj_val){.l = m ? m->target : NULL};
+}
+
+// Handler.getLooper(): the looper it was built on, or the main one for a
+// Handler made with none.
+static klj_val klj_Handler_getLooper(void *env, void *self, const klj_val *a, int n) {
+    klj_handler *h = klj_as_handler(self);
+    if (h && h->looper) return (klj_val){.l = h->looper};
+    return klj_Looper_getMainLooper(env, NULL, a, n);
+}
+
 // sendToTarget() posts the message to the Handler it came from. Never delivered
 // inline: Android returns immediately and the looper delivers later, and the
 // sender here is frequently about to block waiting for that to happen on another
@@ -494,6 +509,62 @@ static klj_val klj_HandlerThread_getLooper(void *env, void *self, const klj_val 
         pthread_create(&lp->thread, NULL, klj_looper_thread, lp);
         KLJ_LOG("HandlerThread.start() — looper thread running");
     }
+    return (klj_val){.j = 0};
+}
+
+// Thread.isAlive(): for a HandlerThread, whether its looper thread has started
+// and not yet left its loop. Video teardown quits the looper and then polls
+// this. Any other Thread here was never run (see Thread.start), so false.
+static klj_val klj_Thread_isAlive(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    if (!o || strcmp(o->cls, "android/os/HandlerThread") != 0 || !o->data)
+        return (klj_val){.j = 0};
+    klj_looper *lp = o->data;
+    pthread_mutex_lock(&lp->lock);
+    int alive = lp->started && !lp->exited;
+    pthread_mutex_unlock(&lp->lock);
+    return (klj_val){.j = (uint64_t)alive};
+}
+
+static klj_looper *klj_handlerthread_looper(void *self) {
+    klj_object *o = klj_as_object(self);
+    return (o && strcmp(o->cls, "android/os/HandlerThread") == 0) ? o->data : NULL;
+}
+
+// HandlerThread.quit()/quitSafely(): stop its loop. Safely would drain what is
+// already queued first; the loop finishes the message in hand either way.
+static klj_val klj_HandlerThread_quit(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_looper *lp = klj_handlerthread_looper(self);
+    if (!lp) return (klj_val){.j = 0};
+    pthread_mutex_lock(&lp->lock);
+    int was = lp->running;
+    lp->running = 0;
+    pthread_cond_broadcast(&lp->wake);
+    pthread_mutex_unlock(&lp->lock);
+    return (klj_val){.j = (uint64_t)was};
+}
+
+// Thread.join(): wait for a HandlerThread's loop to exit. Never from the loop's
+// own thread, and once only.
+static klj_val klj_Thread_join(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_looper *lp = klj_handlerthread_looper(self);
+    if (!lp || !lp->started || pthread_equal(lp->thread, pthread_self()))
+        return (klj_val){.j = 0};
+    pthread_mutex_lock(&lp->lock);
+    int join = !lp->joined;
+    lp->joined = 1;
+    pthread_mutex_unlock(&lp->lock);
+    if (join) pthread_join(lp->thread, NULL);
+    return (klj_val){.j = 0};
+}
+
+// Thread.interrupt(): the only blocking point here is the loop's wait, which
+// quit already wakes; nothing else to interrupt.
+static klj_val klj_Thread_interrupt(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.j = 0};
 }
 
@@ -696,6 +767,7 @@ const klj_binding klj_bind_looper[] = {
     {"android/os/Looper",  "prepare",       "()V",                    klj_Looper_prepare},
     {"android/os/Looper",  "getQueue",      "()Landroid/os/MessageQueue;", klj_Looper_getQueue},
     {"android/os/Looper",  "quit",          "()V",                    klj_Looper_quit},
+    {"android/os/Looper",  "quitSafely",    "()V",                    klj_Looper_quit},
     {"android/os/MessageQueue", "next",     "()Landroid/os/Message;", klj_MessageQueue_next},
     // A HandlerThread is a thread with a Looper on it. We have one queue and one
     // drain point (kl_jni_drain_ui_tasks) for the main looper — but a
@@ -703,10 +775,17 @@ const klj_binding klj_bind_looper[] = {
     // waiting on it. See the looper section above.
     {"android/os/Handler", "obtainMessage", "(I)Landroid/os/Message;", klj_Handler_obtainMessage},
     {"android/os/Message", "sendToTarget", "()V", klj_Message_sendToTarget},
+    {"android/os/Message", "getTarget", "()Landroid/os/Handler;", klj_Message_getTarget},
+    {"android/os/Handler", "getLooper", "()Landroid/os/Looper;", klj_Handler_getLooper},
     {"android/view/Choreographer", "getInstance", "()Landroid/view/Choreographer;", klj_Choreographer_getInstance},
     {"android/view/Choreographer", "postFrameCallback", "(Landroid/view/Choreographer$FrameCallback;)V", klj_Choreographer_postFrameCallback},
     {"android/os/HandlerThread", "<init>", "(Ljava/lang/String;)V", klj_HandlerThread_init},
     {"android/os/HandlerThread", "start", "()V", klj_HandlerThread_start},
+    {"java/lang/Thread", "isAlive", "()Z", klj_Thread_isAlive},
+    {"java/lang/Thread", "join", "()V", klj_Thread_join},
+    {"java/lang/Thread", "interrupt", "()V", klj_Thread_interrupt},
+    {"android/os/HandlerThread", "quit", "()Z", klj_HandlerThread_quit},
+    {"android/os/HandlerThread", "quitSafely", "()Z", klj_HandlerThread_quit},
     {"android/os/HandlerThread", "getLooper", "()Landroid/os/Looper;", klj_HandlerThread_getLooper},
     {"android/os/Handler", "<init>", "()V",                        klj_Handler_init},
     {"android/os/Handler", "<init>", "(Landroid/os/Looper;)V",     klj_Handler_init},

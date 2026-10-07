@@ -1620,6 +1620,8 @@ const klj_binding klj_bind_android[] = {
     {"com/vertigogames/vertigoandroidutils/LogcatUtility", "clearLogs", "()V", klj_false},
     {"com/vertigogames/vertigoandroidutils/LoggerInstance", "logToFile",
      "(Ljava/lang/String;Ljava/lang/String;)Z", klj_false},
+    // no launch extras exist, so an absent array is null like any absent extra
+    {"android/content/Intent", "getFloatArrayExtra", "(Ljava/lang/String;)[F", klj_Intent_getStringExtra},
     {"android/content/Intent", "getStringExtra",  "(Ljava/lang/String;)Ljava/lang/String;",
      klj_Intent_getStringExtra},
     {"android/content/Intent", "getComponent",    "()Landroid/content/ComponentName;",
