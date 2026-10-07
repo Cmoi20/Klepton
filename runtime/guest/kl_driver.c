@@ -124,6 +124,11 @@ static void kl_driver_env_defaults(const kl_target *t) {
         setenv("KL_USLEEP_CAP", "250", 0);   // microseconds; the FMOD poll slept 5-33 ms/call
         setenv("KL_GUEST_QOS",  "1",   0);   // USER_INITIATED instead of default
     }
+    else if (!strcmp(t->name, "citiesvr")) {
+        // Unity on Vulkan keeps its OVROverlay render textures bottom-up like GL,
+        // so the Vulkan top-left assumption draws the loading logo upside down.
+        setenv("KL_OVERLAY_FLIP_Y", "1", 0);
+    }
 }
 
 void kl_driver_init(const kl_target *t, const char *libdir, kl_slink_door door) {
