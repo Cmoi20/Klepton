@@ -166,6 +166,24 @@ static bool klm_AMediaFormat_getString(void *fmt, const char *key, const char **
     return true;
 }
 
+// Floats ride the int32 slot, which is how getFloat already reads them back.
+static void klm_AMediaFormat_setFloat(void *fmt, const char *key, float v) {
+    klm_AMediaFormat_setInt32(fmt, key, (int32_t)v);
+}
+// csd-0/csd-1 and friends: the demuxer injects parameter sets itself, so a
+// buffer key is never carried and a set one is not needed downstream.
+static bool klm_AMediaFormat_getBuffer(void *fmt, const char *key, void **data, size_t *size) {
+    (void)fmt; (void)key; (void)data; (void)size;
+    return false;
+}
+static void klm_AMediaFormat_setBuffer(void *fmt, const char *key, const void *data, size_t size) {
+    (void)fmt; (void)key; (void)data; (void)size;
+}
+static const char *klm_AMediaFormat_toString(void *fmt) {
+    (void)fmt;
+    return "AMediaFormat";
+}
+
 // The format-key constants. These are DATA symbols in the NDK
 // (`extern const char *AMEDIAFORMAT_KEY_MIME;`), so the shim exports the
 // ADDRESS of each pointer and the guest loads through it — get this wrong and
@@ -242,6 +260,7 @@ typedef struct {
     uint32_t magic;
     char    *source;        // for the report: what it was asked to open
     kl_avdemux *dm;         // the demuxer, when a container was opened (else NULL)
+    char    *spill;         // a custom source copied to disk, removed on delete
 } klm_extractor;
 
 static klm_extractor *klm_ex(void *ex) {
@@ -266,6 +285,7 @@ static int klm_AMediaExtractor_delete(void *ex) {
     klm_extractor *x = klm_ex(ex);
     if (!x) return AMEDIA_ERROR_INVALID_OBJECT;
     if (x->dm) { kl_avdemux_close(x->dm); x->dm = NULL; }
+    if (x->spill) { unlink(x->spill); free(x->spill); }
     free(x->source);
     x->magic = 0;
     free(x);
@@ -333,6 +353,97 @@ static int klm_AMediaExtractor_setDataSourceFd(void *ex, int fd, int64_t offset,
     return klm_extractor_refuse(x, named ? path : NULL);
 }
 
+// AMediaDataSource: the guest's own reader, as callbacks. Unity hands one over
+// for a clip it reads out of its packed data. The demuxer wants a file, so the
+// whole source is pulled through readAt into a temp file once, and that file
+// is demuxed like any other. Called on the guest's thread, so the callbacks are
+// plain calls.
+typedef ssize_t (*klm_ds_readat)(void *ud, int64_t off, void *buf, size_t size);
+typedef ssize_t (*klm_ds_getsize)(void *ud);
+typedef void    (*klm_ds_close)(void *ud);
+#define KLM_DS_MAGIC 0x4b4c4453u   /* 'KLDS' */
+typedef struct {
+    uint32_t       magic;
+    void          *ud;
+    klm_ds_readat  readAt;
+    klm_ds_getsize getSize;
+    klm_ds_close   close;
+} klm_datasource;
+
+static klm_datasource *klm_ds(void *p) {
+    klm_datasource *d = p;
+    return (d && d->magic == KLM_DS_MAGIC) ? d : NULL;
+}
+static void *klm_AMediaDataSource_new(void) {
+    klm_datasource *d = calloc(1, sizeof *d);
+    if (d) d->magic = KLM_DS_MAGIC;
+    return d;
+}
+static void klm_AMediaDataSource_delete(void *p) {
+    klm_datasource *d = klm_ds(p);
+    if (!d) return;
+    d->magic = 0;
+    free(d);
+}
+static void klm_AMediaDataSource_setUserdata(void *p, void *ud) {
+    klm_datasource *d = klm_ds(p); if (d) d->ud = ud;
+}
+static void klm_AMediaDataSource_setReadAt(void *p, void *fn) {
+    klm_datasource *d = klm_ds(p); if (d) d->readAt = (klm_ds_readat)fn;
+}
+static void klm_AMediaDataSource_setGetSize(void *p, void *fn) {
+    klm_datasource *d = klm_ds(p); if (d) d->getSize = (klm_ds_getsize)fn;
+}
+static void klm_AMediaDataSource_setClose(void *p, void *fn) {
+    klm_datasource *d = klm_ds(p); if (d) d->close = (klm_ds_close)fn;
+}
+
+static char *klm_spill_source(klm_datasource *d) {
+    const char *tmp = getenv("TMPDIR");
+    char *path = NULL;
+    if (asprintf(&path, "%s/klm-src-XXXXXX.mp4", tmp && *tmp ? tmp : "/tmp") < 0) return NULL;
+    int fd = mkstemps(path, 4);
+    if (fd < 0) { free(path); return NULL; }
+    ssize_t total = d->getSize ? d->getSize(d->ud) : -1;
+    size_t cap = 1u << 20;
+    uint8_t *buf = malloc(cap);
+    int64_t off = 0;
+    int ok = buf != NULL;
+    while (ok && (total < 0 || off < total)) {
+        size_t want = cap;
+        if (total >= 0 && (int64_t)want > total - off) want = (size_t)(total - off);
+        ssize_t got = d->readAt(d->ud, off, buf, want);
+        if (got <= 0) break;
+        if (write(fd, buf, (size_t)got) != got) ok = 0;
+        off += got;
+    }
+    free(buf);
+    close(fd);
+    if (!ok || off == 0) { unlink(path); free(path); return NULL; }
+    fprintf(stderr, "  [media] AMediaDataSource: copied %lld bytes to %s\n", (long long)off, path);
+    return path;
+}
+
+static int klm_AMediaExtractor_setDataSourceCustom(void *ex, void *src) {
+    klm_extractor *x = klm_ex(ex);
+    if (!x) return AMEDIA_ERROR_INVALID_OBJECT;
+    klm_datasource *d = klm_ds(src);
+    if (!klm_extractor_enabled() || !d || !d->readAt)
+        return klm_extractor_refuse(x, "(custom data source)");
+    char *path = klm_spill_source(d);
+    if (path) {
+        x->dm = kl_avdemux_open(path, 0, 0);
+        if (x->dm) {
+            x->spill = path;
+            free(x->source); x->source = strdup(path);
+            fprintf(stderr, "  [media] AMediaExtractor: demuxing custom source via %s\n", path);
+            return AMEDIA_OK;
+        }
+        unlink(path); free(path);
+    }
+    return klm_extractor_refuse(x, "(custom data source)");
+}
+
 // Everything past the refusal describes an extractor with nothing in it. These
 // are the values the NDK defines for "no more samples" / "no such track", not
 // invented ones, so a guest that ignored the setDataSource status still walks a
@@ -391,6 +502,15 @@ static bool klm_AMediaExtractor_advance(void *ex) {
     klm_extractor *x = klm_ex(ex);
     if (!x || !x->dm) return false;
     return kl_avdemux_advance(x->dm) != 0;
+}
+static uint32_t klm_AMediaExtractor_getSampleFlags(void *ex) {
+    klm_extractor *x = klm_ex(ex);
+    if (!x || !x->dm) return 0;
+    return kl_avdemux_sample_keyframe(x->dm) ? 1u : 0u;   // AMEDIAEXTRACTOR_SAMPLE_FLAG_SYNC
+}
+static int klm_AMediaExtractor_unselectTrack(void *ex, size_t i) {
+    (void)i;
+    return klm_ex(ex) ? AMEDIA_OK : AMEDIA_ERROR_INVALID_OBJECT;
 }
 static int klm_AMediaExtractor_seekTo(void *ex, int64_t us, int mode) {
     (void)mode;
@@ -1042,6 +1162,18 @@ static int klm_AMediaCodec_releaseOutputBuffer(void *codec, size_t idx, bool ren
     return AMEDIA_OK;
 }
 
+// only decoders exist here, and only by type; NULL is the NDK's "no such codec"
+static void *klm_AMediaCodec_createNone(const char *name) {
+    fprintf(stderr, "  [media] AMediaCodec: no codec for \"%s\" by name or as an encoder\n",
+            name ? name : "");
+    return NULL;
+}
+// presentation time is the compositor's to pick here; the frame renders now
+static int klm_AMediaCodec_releaseOutputBufferAtTime(void *codec, size_t idx, int64_t ns) {
+    (void)ns;
+    return klm_AMediaCodec_releaseOutputBuffer(codec, idx, true);
+}
+
 // ---------------------------------------------------------------------------
 // ATrace. Two calls, no state, and they are on the guest's per-frame path — the
 // point of serving them is that they are free and their absence is not.
@@ -1090,6 +1222,10 @@ static const struct { const char *name; void *fn; } g_media[] = {
     M("AMediaFormat_delete",    klm_AMediaFormat_delete),
     M("AMediaFormat_setInt32",  klm_AMediaFormat_setInt32),
     M("AMediaFormat_setString", klm_AMediaFormat_setString),
+    M("AMediaFormat_setFloat",  klm_AMediaFormat_setFloat),
+    M("AMediaFormat_getBuffer", klm_AMediaFormat_getBuffer),
+    M("AMediaFormat_setBuffer", klm_AMediaFormat_setBuffer),
+    M("AMediaFormat_toString",  klm_AMediaFormat_toString),
     M("AMediaFormat_getInt32",  klm_AMediaFormat_getInt32),
     M("AMediaFormat_getInt64",  klm_AMediaFormat_getInt64),
     M("AMediaFormat_getFloat",  klm_AMediaFormat_getFloat),
@@ -1118,6 +1254,8 @@ static const struct { const char *name; void *fn; } g_media[] = {
     M("AMEDIAFORMAT_KEY_SLICE_HEIGHT",   &g_key_slice_height),
 
     M("AMediaCodec_createDecoderByType",  klm_AMediaCodec_createDecoderByType),
+    M("AMediaCodec_createCodecByName",    klm_AMediaCodec_createNone),
+    M("AMediaCodec_createEncoderByType",  klm_AMediaCodec_createNone),
     M("AMediaCodec_configure",            klm_AMediaCodec_configure),
     M("AMediaCodec_start",                klm_AMediaCodec_start),
     M("AMediaCodec_stop",                 klm_AMediaCodec_stop),
@@ -1128,6 +1266,7 @@ static const struct { const char *name; void *fn; } g_media[] = {
     M("AMediaCodec_queueInputBuffer",     klm_AMediaCodec_queueInputBuffer),
     M("AMediaCodec_dequeueOutputBuffer",  klm_AMediaCodec_dequeueOutputBuffer),
     M("AMediaCodec_releaseOutputBuffer",  klm_AMediaCodec_releaseOutputBuffer),
+    M("AMediaCodec_releaseOutputBufferAtTime", klm_AMediaCodec_releaseOutputBufferAtTime),
     M("AMediaCodec_getOutputBuffer",      klm_AMediaCodec_getOutputBuffer),
     M("AMediaCodec_getOutputFormat",      klm_AMediaCodec_getOutputFormat),
 
@@ -1144,6 +1283,15 @@ static const struct { const char *name; void *fn; } g_media[] = {
     M("AMediaExtractor_getSampleTime",       klm_AMediaExtractor_getSampleTime),
     M("AMediaExtractor_advance",             klm_AMediaExtractor_advance),
     M("AMediaExtractor_seekTo",              klm_AMediaExtractor_seekTo),
+    M("AMediaExtractor_getSampleFlags",      klm_AMediaExtractor_getSampleFlags),
+    M("AMediaExtractor_unselectTrack",       klm_AMediaExtractor_unselectTrack),
+    M("AMediaExtractor_setDataSourceCustom", klm_AMediaExtractor_setDataSourceCustom),
+    M("AMediaDataSource_new",                klm_AMediaDataSource_new),
+    M("AMediaDataSource_delete",             klm_AMediaDataSource_delete),
+    M("AMediaDataSource_setUserdata",        klm_AMediaDataSource_setUserdata),
+    M("AMediaDataSource_setReadAt",          klm_AMediaDataSource_setReadAt),
+    M("AMediaDataSource_setGetSize",         klm_AMediaDataSource_setGetSize),
+    M("AMediaDataSource_setClose",           klm_AMediaDataSource_setClose),
 
     M("AImageReader_newWithUsage",       klm_AImageReader_newWithUsage),
     M("AImageReader_setImageListener",   klm_AImageReader_setImageListener),
