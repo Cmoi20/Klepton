@@ -45,6 +45,7 @@ void *kl_ovrplat_dlopen(const char *soname);   // NULL if not the platform loade
 int   kl_ovrplat_claims(const char *soname);   // the same test, without opening
 int   kl_ovrplat_is_handle(const void *h);
 void *kl_ovrplat_sym(const char *name);
+int   kl_ovrplat_is_enum_helper(const char *name);
 
 // Which ovr_* the guest resolved and called, and which DRM entry points it asked
 // for — the last of those is worth seeing even when nothing aborted.

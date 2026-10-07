@@ -2389,7 +2389,8 @@ void *kl_shim_lookup(const char *name) {
     // `ovrp_` is OVRPlugin's prefix and a different library (kl_ovrp), so the
     // fourth character is checked: `ovr_` and `ovrID` are the platform's, and
     // `ovrp_` must not be claimed here.
-    if (!strncmp(name, "ovr_", 4) || !strncmp(name, "ovrID", 5))
+    if (!strncmp(name, "ovr_", 4) || !strncmp(name, "ovrID", 5) ||
+        kl_ovrplat_is_enum_helper(name))
         return kl_ovrplat_sym(name);
     return NULL;
 }

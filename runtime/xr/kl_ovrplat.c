@@ -886,6 +886,17 @@ static int plat_is_launch_field(const char *name) {
     return strncmp(name, "ovr_LaunchDetails_", 18) == 0;
 }
 
+// The SDK's enum helpers, ovr<Enum>_ToString / ovr<Enum>_FromString. Every
+// enum's 0 is its Unknown, which is what the launch fields above already answer.
+static uint64_t klplat_enum_to_string(void) { return (uint64_t)(uintptr_t)"Unknown"; }
+static uint64_t klplat_enum_from_string(void) { return 0; }
+
+int kl_ovrplat_is_enum_helper(const char *name) {
+    if (strncmp(name, "ovr", 3) || name[3] < 'A' || name[3] > 'Z') return 0;
+    const char *u = strrchr(name, '_');
+    return u && (!strcmp(u, "_ToString") || !strcmp(u, "_FromString"));
+}
+
 // ...and the empty ARRAY that a NULL list handle turns into one call later.
 //
 // The managed `DeserializableList<T>` reads three things off a list handle —
@@ -1113,6 +1124,10 @@ void *kl_ovrplat_sym(const char *name) {
         return kl_named_stub(name, (void *)klplat_launch_details);
     if (plat_is_launch_field(name))
         return kl_named_stub(name, (void *)klplat_launch_field);
+    if (kl_ovrplat_is_enum_helper(name))
+        return kl_named_stub(name, strstr(name, "_ToString")
+                                   ? (void *)klplat_enum_to_string
+                                   : (void *)klplat_enum_from_string);
     if (plat_is_empty_array(name))
         return kl_named_stub(name, (void *)klplat_empty_array);
     if (plat_is_options_sink(name))
