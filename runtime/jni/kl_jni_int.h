@@ -172,6 +172,7 @@ klj_val     klj_Uri_EMPTY(void);
 klj_val     klj_metaData_field(void);
 klj_val     klj_currentActivity_field(void);
 klj_val     klj_porterduff_clear(void);
+klj_val     klj_bitmap_config_field(void);
 
 // ---------------------------------------------------------------- the tables
 // One per family file, plus the NULL-terminated lists kl_jni.c resolves through.
