@@ -519,8 +519,6 @@ final class KleptonControllers {
               + "dpads \(p.dpads.keys.sorted())")
     }
 
-    nonisolated(unsafe) private static var saidLiveFallback = false
-
     /// Element names seen pressed at least once, across every controller.
     nonisolated(unsafe) private static var pressSeen = Set<String>()
 
@@ -992,18 +990,10 @@ final class KleptonControllers {
 
             c.input.inputStateQueueDepth = 1
             // nil is "nothing new since you last asked", NOT "everything is
-            // released" — so on nil the live snapshot is read instead, which is
-            // the current state and never a fabricated release. It also survives
-            // the queue going quiet for good: a Digital Crown volume change takes
-            // controller focus for the HUD and the queue never resumes after it.
-            let queued = c.input.nextInputState()
-            let s: GCControllerInputState = queued ?? c.input.capture()
+            // released". Leave this hand's last sample standing — see the
+            // clear-on-attachment note above, which is the other half of this.
+            guard let s = c.input.nextInputState() else { continue }
             let b = s.buttons, ax = s.axes, dp = s.dpads
-            if queued == nil, !Self.saidLiveFallback {
-                Self.saidLiveFallback = true
-                NSLog("[cp] input queue empty for \(c.vendorName ?? "?") — reading the "
-                      + "live state (capture()) on such frames (logged once)")
-            }
 
             // The PSVR2 Sense element names, per controller. Both controllers
             // use the SAME unprefixed names — the hand is the device, not the
