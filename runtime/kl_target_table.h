@@ -13,6 +13,7 @@
 
 KL_TARGET_ROW("beatsaber", "beatsaber", "beatsaber.apk", "beatsaber/assets", "beatsaber/lib/arm64-v8a", "libmain", "beatsaber", "obb", KL_GUEST_UNITY)
 KL_TARGET_ROW("bonelab", "bonelab", "bonelab.apk", "bonelab/assets", "bonelab/lib/arm64-v8a", "libmain", "bonelab", "obb", KL_GUEST_UNITY)
+KL_TARGET_ROW("citiesvr", "citiesvr", "citiesvr.apk", "citiesvr/assets", "citiesvr/lib/arm64-v8a", "libmain", "citiesvr", "obb", KL_GUEST_UNITY)
 KL_TARGET_ROW("cs1", "cs1", "cs1.apk", "cs1/assets", "cs1/lib/arm64-v8a", "libxash", "cs1", "obb", KL_GUEST_SDL2)
 KL_TARGET_ROW("hl1", "hl1", "hl1.apk", "hl1/assets", "hl1/lib/arm64-v8a", "libxash", "hl1", "obb", KL_GUEST_GLES3JNI)
 KL_TARGET_ROW("hl2", "hl2", "hl2.apk", "hl2/assets", "hl2/lib/arm64-v8a", "liblauncher", "hl2", "obb", KL_GUEST_SDL2)

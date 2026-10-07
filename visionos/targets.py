@@ -689,6 +689,22 @@ TARGETS = {
         "product": "KleptonRogueStarGun",
         "display": "Rogue Star Gun",
     },
+    "citiesvr": {
+        # Cities: VR (Fast Travel Games), com.fasttravelgames.mascot. Unity
+        # 2021.3.21f1 + IL2CPP, OVRPlugin + OpenXR plus Pico libs, manifest
+        # requires Vulkan. One OBB, main.502.
+        "libs":    None,
+        "srcdir":  "citiesvr/lib/arm64-v8a",
+        "tree":    "citiesvr",
+        "apk":     "citiesvr.apk",
+        "assets":  "citiesvr/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonCitiesVR",
+        "display": "Cities: VR",
+    },
 }
 
 DEFAULT = "beatsaber"
