@@ -1486,6 +1486,13 @@ final class KleptonCompositor {
         }
         NSLog("[cp] render loop ended after \(presented) presented frames, "
               + "\(iterations) iterations, state=\(String(describing: layerRenderer.state))")
+        // A dismissed space never reopens and the boot window keeps the app active,
+        // so exit like Lifecycle does on background; the next tap is a cold boot.
+        if layerRenderer.state == .invalidated, klEnvOn("KL_EXIT_ON_BACKGROUND", default: true) {
+            NSLog("[cp] immersive space dismissed — exiting (KL_EXIT_ON_BACKGROUND)")
+            fflush(nil)
+            exit(0)
+        }
         // Ends the guest's loop and joins it, so its report — which is the
         // lifecycle report, and belongs to the guest's end of the run rather than
         // to this one — has been written before this returns.

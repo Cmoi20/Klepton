@@ -641,6 +641,70 @@ TARGETS = {
         "product": "KleptonPortalVR",
         "display": "Portal",
     },
+    "pistolwhip": {
+        # Pistol Whip (Cloudhead), com.cloudheadgames.pistolwhip 1.6.0.2 — Unity
+        # + IL2CPP with Beat Saber 1.40's XR pair (libOVRPlugin + libOculusXRPlugin
+        # + openxr_loader). Audio is Wwise (libAkSoundEngine) plus the Oculus and
+        # Pico spatializers. One OBB, main.2105.
+        "libs":    None,
+        "srcdir":  "pistolwhip/lib/arm64-v8a",
+        "tree":    "pistolwhip",
+        "apk":     "pistolwhip.apk",
+        "assets":  "pistolwhip/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonPistolWhip",
+        "display": "Pistol Whip",
+    },
+    "tetriseffect": {
+        # Tetris Effect: Connected (Enhance), com.enhanceexperience.tetriseffect
+        # 2.0.2 — UE4 through com.epicgames.ue4.GameActivity, lib_name UE4, with
+        # libvrapi + libOVRPlugin (both replaced), Wwise and EOS for the online half.
+        "libs":    None,
+        "srcdir":  "tetriseffect/lib/arm64-v8a",
+        "tree":    "tetriseffect",
+        "apk":     "tetriseffect.apk",
+        "assets":  "tetriseffect/assets",
+        "qtplugins": "",
+        "obb":     "Android/obb/com.enhanceexperience.tetriseffect",
+        "entry":   "libUE4",
+        "kind":    "ue4",
+        "product": "KleptonTetrisEffect",
+        "display": "Tetris Effect",
+    },
+    "roguestargun": {
+        # Rogue Star Gun (DoGames), com.DoGames.RogueStarGun — Unity + IL2CPP,
+        # OVRPlugin + OpenXR, eleven libraries and almost no dex. One OBB, main.531.
+        "libs":    None,
+        "srcdir":  "roguestargun/lib/arm64-v8a",
+        "tree":    "roguestargun",
+        "apk":     "roguestargun.apk",
+        "assets":  "roguestargun/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonRogueStarGun",
+        "display": "Rogue Star Gun",
+    },
+    "citiesvr": {
+        # Cities: VR (Fast Travel Games), com.fasttravelgames.mascot. Unity
+        # 2021.3.21f1 + IL2CPP, OVRPlugin + OpenXR plus Pico libs, manifest
+        # requires Vulkan. One OBB, main.502.
+        "libs":    None,
+        "srcdir":  "citiesvr/lib/arm64-v8a",
+        "tree":    "citiesvr",
+        "apk":     "citiesvr.apk",
+        "assets":  "citiesvr/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonCitiesVR",
+        "display": "Cities: VR",
+    },
 }
 
 DEFAULT = "beatsaber"

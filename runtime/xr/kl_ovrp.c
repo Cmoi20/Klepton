@@ -1837,6 +1837,30 @@ static klovrp_pose klovrp_seq_read(const klovrp_pose *src, const uint32_t *seq) 
     return *src;
 }
 
+// Under EyeLevel the Quest's origin is where the head started, so y ~ 0 at the
+// eye; visionOS poses are floor-relative. The first worn head height is that
+// origin, and the guest-facing node poses are lowered by it. The compositor's
+// own records keep floor coordinates: reprojection only uses deltas.
+// KL_OVRP_EYE_LEVEL=0 restores the raw floor-relative answer.
+static float g_eye_level_y;
+static int   g_eye_level_set;
+
+static void klovrp_note_eye_level(float py) {
+    if (__atomic_load_n(&g_eye_level_set, __ATOMIC_ACQUIRE)) return;
+    if (!(py > 0.3f && py < 2.5f)) return;   // not worn yet, or no tracking
+    g_eye_level_y = py;
+    __atomic_store_n(&g_eye_level_set, 1, __ATOMIC_RELEASE);
+    fprintf(stderr, "  [ovrp] eye-level origin at head Y=%.3f\n", (double)py);
+}
+
+static float klovrp_eye_level_shift(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_OVRP_EYE_LEVEL", 1);
+    if (!on || g_tracking_origin != 0) return 0.0f;
+    if (!__atomic_load_n(&g_eye_level_set, __ATOMIC_ACQUIRE)) return 0.0f;
+    return g_eye_level_y;
+}
+
 // The head pose as PUBLISHED — where the frontend says the head is now. This is
 // the display side's question, not the guest's: the compositor asks it to
 // reproject towards, and the viewer asks it to drive its own composite.
@@ -2033,6 +2057,7 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
     klovrp_derive_motion(&v, &g_head_hist, g_head_pose_time);
     klovrp_pose_write(&g_head_pose, &v);
     __atomic_store_n(&g_head_set, 1, __ATOMIC_RELEASE);
+    klovrp_note_eye_level(py);
     // Pose trace, once a second: the pushed head Y + tracking-origin frame
     // (liminal's "floor drops" bug) and the head YAW (missioniss "can't look
     // around" bug — if yaw does not move as the user turns, the rotation we feed
@@ -3490,7 +3515,7 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
     float *f = out;
     f[0] = p->qx; f[1] = p->qy;      // quat xyz at +0x00
     f[2] = p->qz; f[3] = p->qw;      // quat w at +0x0c
-    f[4] = p->px; f[5] = p->py;      // position at +0x10
+    f[4] = p->px; f[5] = p->py - klovrp_eye_level_shift();   // position at +0x10
     f[6] = p->pz;
         // Velocity at +0x1c and angular velocity at +0x34, both of which were left
     // zero until now. libunity copies all four vectors straight into its XR

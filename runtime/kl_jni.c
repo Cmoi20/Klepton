@@ -1782,6 +1782,8 @@ static const klj_field g_fields[] = {
     KLJ_FFN("com/unity3d/player/UnityPlayer", "currentContext", "Landroid/content/Context;", klj_currentActivity_field),
     KLJ_FFN("com/unity3d/player/UnityPlayer", "currentContext", "Ljava/lang/Object;", klj_currentActivity_field),
     KLJ_FFN("android/graphics/PorterDuff$Mode", "CLEAR", "Landroid/graphics/PorterDuff$Mode;", klj_porterduff_clear),
+    // every config is the same handle: our Bitmap has no pixel store to format
+    KLJ_FFN("android/graphics/Bitmap$Config", "ARGB_8888", "Landroid/graphics/Bitmap$Config;", klj_bitmap_config_field),
 
     KLJ_FFN("android/content/pm/PackageItemInfo", "metaData", "Landroid/os/Bundle;", klj_metaData_field),
     KLJ_FFN("android/content/pm/ApplicationInfo", "metaData", "Landroid/os/Bundle;", klj_metaData_field),

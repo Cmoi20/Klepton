@@ -1077,6 +1077,11 @@ int kl_app_guest_start(void) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+    // Android's main thread has 8 MB; a Darwin pthread defaults to 512 KB, which
+    // a deep guest load (a big city save) overruns. KL_GUEST_STACK_MB overrides.
+    long stack_mb = kl_env_int("KL_GUEST_STACK_MB", 8);
+    if (stack_mb < 1) stack_mb = 8;
+    pthread_attr_setstacksize(&attr, (size_t)stack_mb * 1024 * 1024);
     int rc = pthread_create(&g_guest.thread, &attr, guest_thread, NULL);
     pthread_attr_destroy(&attr);
     if (rc != 0) {

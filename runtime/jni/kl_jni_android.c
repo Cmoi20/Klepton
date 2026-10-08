@@ -742,6 +742,35 @@ static klj_val klj_Buffer_rewind(void *env, void *self, const klj_val *a, int n)
     (void)env; (void)a; (void)n;
     return (klj_val){.l = self};
 }
+// IntBuffer.allocate: a heap buffer, so the payload is the int[] that array()
+// hands back and get/put index straight into it.
+static klj_val klj_IntBuffer_allocate(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int len = n > 0 ? (int)a[0].j : 0;
+    if (len < 0) len = 0;
+    void *obj = kl_jni_new_object("java/nio/IntBuffer");
+    klj_as_object(obj)->data = klj_new_array('I', NULL, len);
+    return (klj_val){.l = obj};
+}
+static int32_t *klj_intbuf_slot(void *self, int64_t i) {
+    klj_array *arr = klj_arr(klj_as_object(self)->data);
+    return (arr && i >= 0 && i < arr->len) ? (int32_t *)arr->data + i : NULL;
+}
+static klj_val klj_IntBuffer_array(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.l = klj_as_object(self)->data};
+}
+static klj_val klj_IntBuffer_get(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    int32_t *p = n > 0 ? klj_intbuf_slot(self, (int32_t)a[0].j) : NULL;
+    return (klj_val){.j = p ? (uint64_t)(int64_t)*p : 0};
+}
+static klj_val klj_IntBuffer_put(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    int32_t *p = n > 1 ? klj_intbuf_slot(self, (int32_t)a[0].j) : NULL;
+    if (p) *p = (int32_t)a[1].j;
+    return (klj_val){.l = self};
+}
 // klj_void_noop is further down — it is the shared void handler, and these
 // bindings use it rather than adding a second one.
 static klj_val klj_PlayAssetDelivery_init(void *env, void *self,
@@ -783,10 +812,30 @@ static klj_val klj_Bitmap_createBitmap(void *env, void *self, const klj_val *a, 
     static void *bmp;
     return klj_singleton("android/graphics/Bitmap", &bmp);
 }
+static klj_val klj_Bitmap_createBitmapFromPixels(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("Bitmap.createBitmap(int[], %d, %d) — handle only, pixels dropped",
+            n > 1 ? (int)a[1].j : 0, n > 2 ? (int)a[2].j : 0);
+    static void *bmp;
+    return klj_singleton("android/graphics/Bitmap", &bmp);
+}
+// no pointer on visionOS, so a custom cursor only has to be a valid object
+static klj_val klj_PointerIcon_create(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *icon;
+    return klj_singleton("android/view/PointerIcon", &icon);
+}
+static klj_val klj_View_setPointerIcon(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+static void *g_bitmap_config;
 static klj_val klj_BitmapConfig_valueOf(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    static void *cfg;
-    return klj_singleton("android/graphics/Bitmap$Config", &cfg);
+    return klj_singleton("android/graphics/Bitmap$Config", &g_bitmap_config);
+}
+klj_val klj_bitmap_config_field(void) {
+    return klj_singleton("android/graphics/Bitmap$Config", &g_bitmap_config);
 }
 static klj_val klj_Canvas_init(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
@@ -1571,6 +1620,8 @@ const klj_binding klj_bind_android[] = {
     {"com/vertigogames/vertigoandroidutils/LogcatUtility", "clearLogs", "()V", klj_false},
     {"com/vertigogames/vertigoandroidutils/LoggerInstance", "logToFile",
      "(Ljava/lang/String;Ljava/lang/String;)Z", klj_false},
+    // no launch extras exist, so an absent array is null like any absent extra
+    {"android/content/Intent", "getFloatArrayExtra", "(Ljava/lang/String;)[F", klj_Intent_getStringExtra},
     {"android/content/Intent", "getStringExtra",  "(Ljava/lang/String;)Ljava/lang/String;",
      klj_Intent_getStringExtra},
     {"android/content/Intent", "getComponent",    "()Landroid/content/ComponentName;",
@@ -1601,9 +1652,18 @@ const klj_binding klj_bind_android[] = {
     {"android/webkit/WebView", "dispatchTouchEvent", "(Landroid/view/MotionEvent;)Z", klj_false},
     {"android/graphics/Bitmap", "createBitmap",
      "(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;", klj_Bitmap_createBitmap},
+    {"android/graphics/Bitmap", "createBitmap",
+     "([IIILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;", klj_Bitmap_createBitmapFromPixels},
+    {"android/view/PointerIcon", "create",
+     "(Landroid/graphics/Bitmap;FF)Landroid/view/PointerIcon;", klj_PointerIcon_create},
+    {"android/view/View", "setPointerIcon", "(Landroid/view/PointerIcon;)V", klj_View_setPointerIcon},
     {"android/graphics/Bitmap$Config", "valueOf",
      "(Ljava/lang/String;)Landroid/graphics/Bitmap$Config;", klj_BitmapConfig_valueOf},
     {"java/nio/ByteBuffer", "rewind", "()Ljava/nio/Buffer;", klj_Buffer_rewind},
+    {"java/nio/IntBuffer", "allocate", "(I)Ljava/nio/IntBuffer;", klj_IntBuffer_allocate},
+    {"java/nio/IntBuffer", "array", "()[I", klj_IntBuffer_array},
+    {"java/nio/IntBuffer", "get", "(I)I", klj_IntBuffer_get},
+    {"java/nio/IntBuffer", "put", "(II)Ljava/nio/IntBuffer;", klj_IntBuffer_put},
     {"android/graphics/Canvas", "<init>", "(Landroid/graphics/Bitmap;)V", klj_Canvas_init},
 
     // The view hierarchy the WebView is hung in. Three classes, and the guest

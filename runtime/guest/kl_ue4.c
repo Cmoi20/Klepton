@@ -84,6 +84,7 @@ static const char *const UE4_CHAIN[] = {
     "libfmodstudio.so",
     "libovraudio64.so",     // the Oculus audio spatializer
     "libplaycore.so",       // Google Play core — the OBB downloader's half
+    "libEOSSDK.so",         // Epic Online Services; tetriseffect links EOS_* directly
     UE4_LIB,
 };
 
