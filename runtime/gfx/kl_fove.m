@@ -2104,10 +2104,23 @@ static id kf_bdesc(id self, SEL cmd, id d) {
     kf_xf_wait(self, en, 2);
     return en;
 }
+// The [fove] stats line is written by kl_fove_perf_field (every 10th call).
+// With nothing else asking for the field, the commit path drives it once a
+// second, so a run's log carries the counters on its own. One thread at a
+// time: the due time is claimed with a compare-and-swap.
+static void kf_tick(void) {
+    static uint64_t due;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), d = __atomic_load_n(&due, __ATOMIC_RELAXED);
+    if (now < d || !__atomic_compare_exchange_n(&due, &d, now + 1000000000ull, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        return;
+    char field[200];
+    kl_fove_perf_field(field, sizeof field);
+}
 static void kf_commit(id self, SEL cmd) {
     kf_flush_at(self, 1);
     ((void (*)(id, SEL))kf_orig(self, cmd))(self, cmd);
     kf_xf_committed(self);
+    kf_tick();
 }
 
 // The clobber check: anyone but us binding fragment buffer slot N.
