@@ -316,6 +316,20 @@ typedef struct {
 // decoder. Prints nothing when there are none.
 void kl_x18_report(FILE *f);
 
+// How many sites the veneer pass REFUSED, across every library loaded so far —
+// patched at load time in this process, or translated offline by klepton-ld
+// and recorded in the dylib's __klstat (kl_x18_note_translated). A refusal is
+// not a site left merely unpatched: a refused site that WRITES x18 leaves the
+// shadow slot stale, and every later read of it is wrong. The count therefore
+// has to be answerable from a running process and not only from `make check`
+// — the host patches at load time and the device runs translations, so a
+// clean host sweep says nothing about the libraries the device actually runs.
+unsigned kl_x18_refusals(void);
+
+// Add an offline translation's refusals to kl_x18_refusals(). Called by the
+// loader when it reads a translated library's record.
+void kl_x18_note_translated(unsigned refused);
+
 // ---------------------------------------------------- data inside code
 //
 // "Executable sections, not the executable segment" is one level too shallow:

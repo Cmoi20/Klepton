@@ -712,6 +712,24 @@ kl_image *kl_load_dylib(const char *path) {
                 free(img); dlclose(h); return NULL;
             }
         }
+        // What the translation did, on the record, on the device. A `br x18`
+        // that branches through a zeroed x18 is a codesigning SIGKILL that
+        // cannot report itself, and a refused site that WRITES x18 leaves the
+        // shadow stale and poisons every later read of it — so the one number
+        // that rules that class in or out is how many sites this library's
+        // veneer pass refused. klepton-ld recorded it and it was read into
+        // img->stats above; print it, including the quiet "0 REFUSED" case: a
+        // line that only appears when something is wrong cannot be used to
+        // prove that nothing is.
+        if (rec->sites || rec->refused)
+            fprintf(stderr, "  [klepton] %s: x18 translated offline — %u site(s), "
+                            "%u patched, %u REFUSED%s\n",
+                    real, rec->sites, rec->patched, rec->refused,
+                    rec->refused ? "  <-- refused sites read Darwin's x18; a "
+                                   "refused WRITE poisons every later read"
+                                 : "");
+        kl_x18_note_translated(rec->refused);
+
         // The CTR_EL0 constant is self-contained — the veneer answers it and
         // nothing here has to agree — so a difference is reported rather than
         // refused. It is reported at all because "the CTR_EL0 value in this
