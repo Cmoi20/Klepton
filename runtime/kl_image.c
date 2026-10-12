@@ -126,6 +126,10 @@ struct kl_image {
     // The x18 veneer pool, reserved on the end of the same mapping so it is
     // within `b`'s reach of the code by construction. munmap frees both.
     size_t     x18_arena_size;
+    // ...and a same-sized second pool BEFORE the image, for the code the end
+    // pool cannot reach in a library wider than one b window. munmap covers
+    // it: the mapping starts this many bytes before base - map_off.
+    size_t     x18_pre_arena_size;
     Elf64_Sym *symtab;
     size_t     nsyms;       // from DT_HASH's nchain; 0 if the image had none
     const char *strtab;
@@ -1076,11 +1080,22 @@ kl_image *kl_load(const char *path) {
     }
     img->x18_arena_size = x18_arena;
 
-    uint8_t *map = mmap(NULL, img->map_size + x18_arena, PROT_READ | PROT_WRITE,
+    // A second arena of the same size BEFORE the image. The end-of-image arena
+    // is within b's +/-128 MB of the top of the code only; for a library wider
+    // than one window (Deadpool VR's libUE4.so is 262 MB) the bottom half needs
+    // a pool below the image just as much, and "somewhere free nearby" is luck —
+    // one ASLR roll gives a 436 MB gap below, the next gives 15 MB and every
+    // veneer is REACH-refused. Reserved here, it is in reach by construction,
+    // which is the whole argument the end arena was added on. Virtual-address
+    // space only; untouched pages are never committed.
+    size_t x18_pre_arena = x18_arena;
+    uint8_t *map = mmap(NULL, x18_pre_arena + img->map_size + x18_arena,
+                        PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANON, -1, 0);
     if (map == MAP_FAILED) { err("mmap image: %s", strerror(errno));
                              free(img); munmap(file, sb.st_size); return NULL; }
-    img->base = map + img->map_off;
+    img->x18_pre_arena_size = x18_pre_arena;
+    img->base = map + x18_pre_arena + img->map_off;
     if (img->map_off)
         fprintf(stderr, "  [klepton] %s: placed %#zx into its mapping so a host "
                         "page boundary falls between the executable bytes and "
@@ -1158,6 +1173,9 @@ kl_image *kl_load(const char *path) {
     uint8_t *x18_arena_base = img->x18_arena_size
                             ? img->base - img->map_off + img->map_size : NULL;
     size_t   x18_arena_used = 0;
+    uint8_t *x18_pre_base = img->x18_pre_arena_size
+                          ? img->base - img->map_off - img->x18_pre_arena_size : NULL;
+    size_t   x18_pre_used = 0;
 
     // The image behind each chunk, so the `br x18` jump-table rewrite can reach
     // the table it has to repoint. Here the chunk addresses ARE the mapped
@@ -1177,12 +1195,49 @@ kl_image *kl_load(const char *path) {
             uint8_t *p = img->base + cva - lo;
             rewrite_tls(p, csz, cva, path, &img->stats);
             if (!veneer) continue;
+            // One more split on top of kl_x18_next_code's. A veneer pool has to
+            // sit within b's +/-128 MB of EVERY site it serves, and a single
+            // executable section of a 262 MB library is wider than two of those
+            // windows put together: one pool per section is in reach of the
+            // section's ends only. Slicing gives each slice its own pool — an
+            // arena's where an arena is near enough, klx_place_pool's search
+            // elsewhere — so a pool only has to reach its own slice's sites.
+            // 32 MB keeps a slice's window wide enough that the pool search has
+            // somewhere to land. A chunk under 32 MB is one slice, exactly as
+            // before.
+            for (size_t off = 0; off < csz; ) {
+            size_t slice = csz - off;
+            if (slice > (32u << 20)) slice = 32u << 20;
+            // Pick the arena whose next slot this slice can actually branch to:
+            // the end arena for the top of the image, the pre-image arena for
+            // the bottom. 120 MB rather than the exact 128 — the pool grows
+            // past the slot and kl_x18_patch re-checks the extremes itself,
+            // falling back to klx_place_pool's search when neither arena
+            // answers (the unservable middle band of a >256 MB image).
+            void   *arena = NULL; size_t *aused = NULL, asize = 0;
+            int64_t slo = (int64_t)(uintptr_t)(p + off);
+            int64_t shi = slo + (int64_t)slice;
+            const int64_t REACH = 120LL << 20;
+            if (x18_arena_base) {
+                int64_t slot = (int64_t)(uintptr_t)(x18_arena_base + x18_arena_used);
+                if (slot - shi < REACH && slot - shi >= 0) {
+                    arena = x18_arena_base; aused = &x18_arena_used;
+                    asize = img->x18_arena_size;
+                }
+            }
+            if (!arena && x18_pre_base) {
+                int64_t slot = (int64_t)(uintptr_t)(x18_pre_base + x18_pre_used);
+                if (slo - slot < REACH && slo - slot >= 0) {
+                    arena = x18_pre_base; aused = &x18_pre_used;
+                    asize = img->x18_pre_arena_size;
+                }
+            }
             kl_x18_stats xs;
-            if (kl_x18_patch(p, csz, x18_arena_base, img->x18_arena_size,
-                             &x18_arena_used, &ximg, &xs) != 0) {
+            if (kl_x18_patch(p + off, slice, arena, asize,
+                             aused, &ximg, &xs) != 0) {
                 fprintf(stderr, "  [klepton] %s: x18 veneering failed to start\n", path);
                 veneer = 0;
-                continue;
+                break;
             }
             // The jump-table rewrite, both halves. A CONVERTED `br x18` no
             // longer branches through x18 at all and cannot be killed by the
@@ -1204,7 +1259,7 @@ kl_image *kl_load(const char *path) {
             // own distance beside it, because the two refusal kinds want
             // different fixes and only one of them is about the decoder.
             if (xs.refused) {
-                int64_t d = (int64_t)xs.pool_va - (int64_t)(uintptr_t)p;
+                int64_t d = (int64_t)xs.pool_va - (int64_t)(uintptr_t)(p + off);
                 fprintf(stderr,
                         "  [klepton] %s: x18 REFUSED %u of %u sites (%u for REACH"
                         " — pool at %#llx, %+lld MB from the code at %p). Those "
@@ -1212,7 +1267,7 @@ kl_image *kl_load(const char *path) {
                         "after any exception return.\n",
                         path, xs.refused, xs.sites, xs.far_refused,
                         (unsigned long long)xs.pool_va,
-                        (long long)(d / (1024 * 1024)), (void *)p);
+                        (long long)(d / (1024 * 1024)), (void *)(p + off));
             }
             img->stats.x18_sites   += xs.sites;
             img->stats.x18_patched += xs.patched;
@@ -1221,6 +1276,8 @@ kl_image *kl_load(const char *path) {
             img->stats.ctr_sites   += xs.ctr_sites;
             img->stats.ctr_patched += xs.ctr_patched;
             img->stats.ctr_refused += xs.ctr_refused;
+            off += slice;
+            }
         }
     }
     // Measured guest patches, here because this is the last moment the image is
@@ -1287,8 +1344,9 @@ void *kl_sym(kl_image *img, const char *name) {
 void kl_unload(kl_image *img) {
     if (!img) return;
     if (img->dl_handle) dlclose(img->dl_handle);   // translated: dyld owns it
-    else                munmap(img->base - img->map_off,
-                               img->map_size + img->x18_arena_size);
+    else                munmap(img->base - img->map_off - img->x18_pre_arena_size,
+                               img->x18_pre_arena_size + img->map_size +
+                               img->x18_arena_size);
     free(img);
 }
 

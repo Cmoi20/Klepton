@@ -1499,9 +1499,23 @@ int kl_x18_patch(void *code, size_t size, void *arena, size_t arena_size,
     // fallback, and for a big image in a crowded process it can fail outright —
     // see klx_place_pool.
     if (arena && arena_used && *arena_used + cap <= arena_size) {
-        base = (uint8_t *)arena + *arena_used;
-        *arena_used += cap;
-        if (mprotect(base, cap, PROT_READ | PROT_WRITE) != 0) base = NULL;
+        uint8_t *slot = (uint8_t *)arena + *arena_used;
+        // ...but adjacent to the image is only "in reach" for the code the pool
+        // can actually see. An arena is one reservation beside the whole span,
+        // so past ~128 MB of image the far chunks are beyond b's range from
+        // every slot in it — Deadpool VR's libUE4.so is 262 MB and lost all
+        // 4141 of its sites to exactly this. Taking the slot regardless is the
+        // refusal with the worst shape: the space is consumed AND the sites run
+        // against Darwin's x18. Check reach on the extremes first and leave the
+        // chunk to klx_place_pool, which searches near the CODE.
+        uintptr_t lo = (uintptr_t)code, hi = lo + size;
+        uintptr_t p0 = (uintptr_t)slot, p1 = p0 + cap;
+        if (!out_of_reach(lo, p0) && !out_of_reach(hi, p0) &&
+            !out_of_reach(lo, p1) && !out_of_reach(hi, p1)) {
+            base = slot;
+            *arena_used += cap;
+            if (mprotect(base, cap, PROT_READ | PROT_WRITE) != 0) base = NULL;
+        }
     }
     if (!base) base = klx_place_pool(code, size, cap);
     if (!base) return -1;
