@@ -4643,6 +4643,27 @@ static int g_next_layer_id = 1;
 // 0 until the first eye texture is handed out. See klovrp_SetupLayer.
 static int g_eye_storage_w, g_eye_storage_h;
 
+// See kl_ovrp.h. Side-effect free: no pose slot is consumed.
+void kl_ovrp_eye_tangents(int eye, float out[4]) {
+    if (!out) return;
+    if ((unsigned)eye > 1) eye = 0;
+    memcpy(out, klovrp_eye_tan(eye), sizeof g_eye_tan[eye]);
+}
+
+// See kl_ovrp.h. Read from the first eye layer whose desc carries a frustum.
+int kl_ovrp_eye_layer_fov(int eye, float out[4]) {
+    if (!out || (unsigned)eye > 1) return 0;
+    for (int i = 0; i < KLOVRP_MAX_LAYERS; i++) {
+        const struct klovrp_layer *l = &g_layers[i];
+        if (!l->id || !l->is_eye) continue;
+        const ovrp_fovf *f = &l->desc.fov[eye];
+        if (!(f->left > 0 && f->right > 0 && f->up > 0 && f->down > 0)) continue;
+        out[0] = f->left; out[1] = f->right; out[2] = f->up; out[3] = f->down;
+        return 1;
+    }
+    return 0;
+}
+
 static struct klovrp_layer *klovrp_layer(int id) {
     if (id <= 0) return NULL;
     for (int i = 0; i < KLOVRP_MAX_LAYERS; i++)
