@@ -564,6 +564,18 @@ unsigned kl_x18_count(const void *code, size_t size) {
     return klx_survey(code, size, NULL, &ctr) + ctr;
 }
 
+// `br x18` alone. Same data-word test as the survey, for the same reason:
+// 0xD61F0240 is an ordinary word to find in a constant table, and a pool sized
+// off a table entry is a pool sized off nothing.
+unsigned kl_x18_count_termbr(const void *code, size_t size) {
+    const uint32_t *w = (const uint32_t *)code;
+    size_t n = size / 4;
+    unsigned c = 0;
+    for (size_t i = 0; i < n; i++)
+        if (w[i] == 0xD61F0240u && !klx_looks_like_data(w, n, i)) c++;
+    return c;
+}
+
 // ---------- instruction encoders ----------
 static uint32_t enc_stp(unsigned t, unsigned t2, int off) {   // stp xT, xT2, [sp, #off]
     return 0xA9000000u | ((uint32_t)((off / 8) & 0x7f) << 15) | (t2 << 10) | (31u << 5) | t;
@@ -702,6 +714,164 @@ uint64_t kl_x18_ctr_value(void) {
 }
 #define ctr_value() kl_x18_ctr_value()
 
+// ======================== the `br x18` jump-table rewrite =======================
+//
+// WHY THIS EXISTS. The guarded veneer below still branches THROUGH x18, and the
+// kernel zeroes x18 on any exception return, so an interrupt taken with the `br`
+// at the head of the pipeline branches to address 0. On visionOS that is an
+// unblockable SIGKILL (CODESIGNING / "Invalid Page") with no signal delivered
+// and nothing written. Arizona Sunshine 2 died on it in three runs of three, on
+// FMOD's 32-way channel-mixer dispatch, which executes on every mix buffer.
+//
+// WHY NOTHING CHEAPER WORKS. The branch register has to still hold the target
+// when the branch issues, and control never comes back, so it is clobbered at
+// the destination — it must therefore be a register the destination does not
+// need. At a jump-table target nothing is dead. Disassembled, at every real
+// site: x16/x17 are set two instructions before the branch and read at the
+// targets, and the dispatch's own temporaries are REUSED before the branch —
+// libfmod+0x85628 ends `add x18, x14, x11 / mov x14, x12 / br x18`, so even x14,
+// which the dispatch itself computes, carries a live value across it. x30 is
+// dead only in non-leaf functions and leaf-ness is not decidable in a stripped
+// image. So the register has to be one we RESTORE, and the only place a restore
+// can run is code of our own at the destination.
+//
+// THE REWRITE. Recognise the dispatch, enumerate its targets out of the table,
+// and give every target a thunk that restores the scratch and branches on with
+// a direct `b` — no register at all in the final branch. Repointing the table's
+// own 32-bit offsets at the thunks means the guest's arithmetic is untouched:
+// `table + entry` still computes, and now lands on the thunk.
+//
+//      site:   b <dispatch>
+//      dispatch: stp x16, x17, [sp, #-16]      spill into the red zone
+//                mrs x16, tpidrro_el0
+//                ldr x16, [x16, #slot*8]       the shadow x18 — now a thunk
+//                br  x16                       x16 is NOT zeroed by the kernel
+//      thunk_k:  ldp x16, x17, [sp, #-16]      restore before the guest sees it
+//                b   target_k                  direct: no register live across
+//
+// There is no window left to lose: nothing the kernel touches is live across a
+// branch. An interrupt anywhere in this sequence restores x16/x17 from the
+// architectural state like any other register.
+//
+// WHY THE SPILL IS ON EVERY `br x18` VENEER, converted or not. A table this pass
+// has repointed now yields thunk addresses to ANY dispatch that reads it, and a
+// site that failed recognition still branches through the guarded veneer. Give
+// every `br x18` veneer the same `stp x16, x17, [sp, #-16]` prologue and both
+// cases are correct: a thunk's `ldp` restores the values that veneer just
+// stored, and a raw target gets x16/x17 untouched because the fallback veneer
+// only STORES them and never writes them. That one instruction is also what
+// makes an alternate entry into the middle of a dispatch harmless, so no
+// branch-target analysis is needed here.
+//
+// WHY THE RECOGNITION IS SAFE WITHOUT PROVING THE DERIVATION. The table base is
+// formed by an `adrp`/`add` pair that is commonly hoisted out of the loop the
+// dispatch sits in, so finding it is a backward scan and a backward scan is not
+// a dataflow proof. The ANSWER is checked instead: the computed base must
+// resolve to non-executable data in this image, and all K+1 entries must be
+// 4-byte-aligned offsets landing inside the very chunk being veneered. A wrong
+// base does not produce thirty-two of those. Anything that fails keeps the
+// guarded veneer, which is exactly what it had before this pass existed.
+typedef struct {
+    size_t   idx;        // word index of the `br x18`
+    uint64_t table_va;
+    unsigned nent;
+    uint64_t thunks_va;  // filled in at emit; 0 until the thunks exist
+} klx_jt;
+
+static int64_t klx_sxt(uint64_t v, unsigned bits) {
+    return (int64_t)(v << (64 - bits)) >> (64 - bits);
+}
+
+// Recognise the dispatch idiom ending in the `br x18` at word `i`, scanning back
+// at most KLX_JT_SCAN words for each part, and fill `r` if every check below
+// holds. Returns 0 — keep the guarded veneer — on any doubt.
+static int klx_jt_recognise(const uint32_t *w, size_t n, size_t i,
+                            uint64_t code_va,
+                            const kl_x18_image *im, klx_jt *r) {
+    if (!im || !im->data_at) return 0;
+
+    size_t lo = i > KLX_JT_SCAN ? i - KLX_JT_SCAN : 0;
+    unsigned xA = 0, xB = 0, xN = 0, xBase = 0;
+    size_t jadd = 0, jldr = 0, jcmp = 0, jbase = 0, jadrp = 0;
+    int got;
+
+    // add x18, xA, xB — 64-bit shifted-register form, shift 0.
+    for (got = 0, jadd = i; jadd-- > lo; ) {
+        uint32_t v = w[jadd];
+        if ((v & 0xFFE0FC00u) == 0x8B000000u && (v & 31u) == 18u) {
+            xA = (v >> 5) & 31; xB = (v >> 16) & 31; got = 1; break;
+        }
+        // Any earlier write of x18 means this is not the producer.
+        klx_info in;
+        if (klx_decode(v, &in) && (in.roles & KLX_W)) return 0;
+    }
+    // xA == 18 is libunity's shape (`ldrsw x18,[base,idx]` / `add x18,x18,base`)
+    // and is fine — the value is in the shadow slot either way. xB naming x18
+    // would put the TABLE BASE in the shadow, which no compiler emits and which
+    // this recogniser has no reason to model.
+    if (!got || xB == 18) return 0;
+
+    // ldrsw xA, [xB, xN, lsl #2]
+    for (got = 0, jldr = jadd; jldr-- > lo; ) {
+        uint32_t v = w[jldr];
+        if ((v & 0xFFE0FC00u) == 0xB8A07800u && (v & 31u) == xA &&
+            ((v >> 5) & 31u) == xB) { xN = (v >> 16) & 31; got = 1; break; }
+    }
+    if (!got) return 0;
+
+    // cmp wN, #K — the bound, and the only reason we know how many entries the
+    // table has. Without it the index is unbounded and the rewrite would leave
+    // reachable entries unrepointed.
+    unsigned nent = 0;
+    for (got = 0, jcmp = jldr; jcmp-- > lo; ) {
+        uint32_t v = w[jcmp];
+        if ((v & 0xFFC0001Fu) == 0x7100001Fu && ((v >> 5) & 31u) == xN &&
+            !((v >> 22) & 1u)) { nent = ((v >> 10) & 0xFFFu) + 1; got = 1; break; }
+    }
+    if (!got || nent > KLX_JT_MAX_ENTRIES) return 0;
+
+    // ...and the `b.hi` that acts on it. A `cmp` with no branch is not a bound.
+    got = 0;
+    for (size_t k = jcmp + 1; k <= jldr; k++)
+        if ((w[k] & 0xFF00001Fu) == 0x54000008u) { got = 1; break; }
+    if (!got) return 0;
+
+    // add xB, xBase, #imm12 (shift 0), then adrp xBase, page.
+    unsigned imm12 = 0;
+    for (got = 0, jbase = jldr; jbase-- > lo; ) {
+        uint32_t v = w[jbase];
+        if ((v & 0xFF800000u) == 0x91000000u && (v & 31u) == xB &&
+            !((v >> 22) & 3u)) {
+            xBase = (v >> 5) & 31; imm12 = (v >> 10) & 0xFFFu; got = 1; break;
+        }
+    }
+    if (!got) return 0;
+    for (got = 0, jadrp = jbase; jadrp-- > lo; ) {
+        uint32_t v = w[jadrp];
+        if ((v & 0x9F000000u) == 0x90000000u && (v & 31u) == xBase) { got = 1; break; }
+    }
+    if (!got) return 0;
+
+    uint32_t a = w[jadrp];
+    int64_t  page = klx_sxt((((uint64_t)((a >> 5) & 0x7FFFF)) << 2) | ((a >> 29) & 3), 21);
+    uint64_t apc  = code_va + (uint64_t)jadrp * 4;
+    uint64_t table_va = ((apc & ~0xFFFULL) + (uint64_t)(page << 12)) + imm12;
+
+    // The answer, checked. Non-executable data in this image, and every entry a
+    // 4-byte-aligned offset landing inside the chunk being veneered.
+    const int32_t *ent = (const int32_t *)im->data_at(im->ctx, table_va,
+                                                      (size_t)nent * 4);
+    if (!ent) return 0;
+    for (unsigned e = 0; e < nent; e++) {
+        uint64_t t = table_va + (uint64_t)(int64_t)ent[e];
+        if (t & 3) return 0;
+        if (t < code_va || t >= code_va + (uint64_t)n * 4) return 0;
+    }
+
+    r->idx = i; r->table_va = table_va; r->nent = nent; r->thunks_va = 0;
+    return 1;
+}
+
 // The emitter proper. `code_va`/`pool_va` are the addresses the two buffers will
 // have when the code executes, which is what every `b` and `adrp` is computed
 // against; the buffers themselves may live anywhere (a file image being laid out
@@ -709,6 +879,14 @@ uint64_t kl_x18_ctr_value(void) {
 int kl_x18_emit(void *code, size_t size, uint64_t code_va,
                 void *pool, size_t poolcap, uint64_t pool_va,
                 kl_x18_stats *st, size_t *pool_used) {
+    return kl_x18_emit_img(code, size, code_va, pool, poolcap, pool_va,
+                           NULL, st, pool_used);
+}
+
+int kl_x18_emit_img(void *code, size_t size, uint64_t code_va,
+                    void *pool, size_t poolcap, uint64_t pool_va,
+                    const kl_x18_image *image,
+                    kl_x18_stats *st, size_t *pool_used) {
     memset(st, 0, sizeof *st);
 
     uint32_t *w = (uint32_t *)code;
@@ -720,6 +898,22 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
     int do_x18 = want && veneer_enabled();
     int do_ctr = st->ctr_sites && ctr_enabled();
     if (!do_x18 && !do_ctr) return 0;
+
+    // Pass A: recognise the `br x18` jump-table dispatches BEFORE anything is
+    // patched. This has to happen first and it is not an optimisation: the
+    // recogniser reads the instructions above the branch — the `cmp`, the
+    // `ldrsw`, the `add`, the `adrp` — and every one of those is itself an x18
+    // site that the loop below overwrites with a `b` on its way past. Recognise
+    // after patching and the idiom is already gone.
+    klx_jt jt[KLX_JT_MAX_SITES];
+    unsigned njt = 0;
+    if (do_x18 && image && image->data_at) {
+        for (size_t i = 0; i < n && njt < KLX_JT_MAX_SITES; i++) {
+            if (w[i] != 0xD61F0240u) continue;
+            if (klx_looks_like_data(w, n, i)) continue;
+            if (klx_jt_recognise(w, n, i, code_va, image, &jt[njt])) njt++;
+        }
+    }
 
     uint32_t *out = (uint32_t *)pool, *pool_end = (uint32_t *)((uint8_t *)pool + poolcap);
 
@@ -854,11 +1048,91 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
         // with no signal delivered and no handler able to see it. It has never
         // been observed.
         if (in.hazard == KLX_HZ_TERMBR) {
+            // The jump-table rewrite, when pass A recognised this
+            // site. See the block comment above klx_jt_recognise for the whole
+            // argument; here is only the emission.
+            klx_jt *r = NULL;
+            for (unsigned q = 0; q < njt; q++) if (jt[q].idx == i) { r = &jt[q]; break; }
+            if (r) {
+                // A table already repointed by an earlier site in this chunk is
+                // reused rather than rewritten twice — the thunks are identical,
+                // and a second pass over the offsets would double-apply them.
+                klx_jt *share = NULL;
+                for (unsigned q = 0; q < njt; q++)
+                    if (&jt[q] != r && jt[q].thunks_va && jt[q].table_va == r->table_va &&
+                        jt[q].nent >= r->nent) { share = &jt[q]; break; }
+
+                unsigned need = 4 + (share ? 0 : 2 * r->nent);
+                int32_t *ent = (int32_t *)image->data_at(image->ctx, r->table_va,
+                                                         (size_t)r->nent * 4);
+                if (ent && out + need <= pool_end) {
+                    uint64_t thunks_va = share ? share->thunks_va : vpc;
+                    uint32_t *tout = out;
+                    int ok = 1;
+
+                    // Thunks first, so the dispatch veneer's own address is
+                    // known only after them — everything is computed against
+                    // `pool_va`, so the order is free either way.
+                    if (!share) {
+                        for (unsigned e = 0; e < r->nent && ok; e++) {
+                            uint64_t tva = thunks_va + (uint64_t)e * 8;
+                            uint64_t tgt = r->table_va + (uint64_t)(int64_t)ent[e];
+                            tout[e * 2] = enc_ldp(16, 17, -16);
+                            ok &= enc_b(tva + 4, tgt, &tout[e * 2 + 1]);
+                        }
+                        // ...and the table only after every thunk encoded. A
+                        // half-repointed table is an image that runs wrong
+                        // rather than one that refuses.
+                        if (ok)
+                            for (unsigned e = 0; e < r->nent; e++) {
+                                int64_t d = (int64_t)(thunks_va + (uint64_t)e * 8)
+                                          - (int64_t)r->table_va;
+                                if (d < INT32_MIN || d > INT32_MAX) { ok = 0; break; }
+                            }
+                    }
+
+                    // The dispatch sits after this site's own thunks; a site
+                    // reusing another's thunks emits only the dispatch.
+                    uint32_t body[4], patch;
+                    uint64_t dva = share ? vpc : vpc + (uint64_t)r->nent * 8;
+                    body[0] = enc_stp(16, 17, -16);
+                    body[1] = enc_mrs_tpidrro(16);
+                    body[2] = enc_ldr(16, 16, (unsigned)KLX_TSD_SLOT * 8);
+                    body[3] = 0xD61F0200u;            // br x16
+                    ok &= enc_b(spc, dva, &patch);
+
+                    if (ok) {
+                        if (!share) {
+                            out += 2 * r->nent;
+                            for (unsigned e = 0; e < r->nent; e++)
+                                ent[e] = (int32_t)((int64_t)(thunks_va + (uint64_t)e * 8)
+                                                 - (int64_t)r->table_va);
+                            st->jt_thunks += r->nent;
+                        }
+                        memcpy(out, body, sizeof body);
+                        out += 4;
+                        w[i] = patch;
+                        r->thunks_va = thunks_va;
+                        st->patched++;
+                        st->jt_sites++;
+                        continue;
+                    }
+                }
+                // Fell through: no room, or a target out of `b` reach. The
+                // guarded veneer below is still correct, and the table has not
+                // been touched.
+            }
+
             if (out + VEN_MAX_INSN > pool_end) {
                 note_refusal(word); st->refused++; continue;
             }
             uint32_t body[VEN_MAX_INSN], patch;
             unsigned k = 0;
+            // The spill that makes a repointed table safe for an UNCONVERTED
+            // site. This veneer only stores x16/x17 and never writes them, so a
+            // raw target sees them unchanged; a thunk's `ldp` restores exactly
+            // what was stored. See "WHY THE SPILL IS ON EVERY `br x18` VENEER".
+            body[k++] = enc_stp(16, 17, -16);
             body[k++] = enc_mrs_tpidrro(18);
             body[k++] = enc_ldr(18, 18, (unsigned)KLX_TSD_SLOT * 8);
             // The load-use guard (see above): this instruction is what moves the
@@ -874,6 +1148,7 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
             out += k;
             w[i] = patch;
             st->patched++;
+            st->jt_fallback++;
             continue;
         }
 
@@ -1032,7 +1307,8 @@ static uint8_t *klx_place_pool(void *code, size_t size, size_t cap) {
 // the executing addresses *are* the buffer addresses, which is the degenerate
 // case of kl_x18_emit.
 int kl_x18_patch(void *code, size_t size, void *arena, size_t arena_size,
-                 size_t *arena_used, kl_x18_stats *st) {
+                 size_t *arena_used, const kl_x18_image *image,
+                 kl_x18_stats *st) {
     memset(st, 0, sizeof *st);
 
     // Same reason as in kl_x18_emit: the data-word tally has to survive the
@@ -1047,7 +1323,14 @@ int kl_x18_patch(void *code, size_t size, void *arena, size_t arena_size,
     // SIGILL because of a register the code in question never names.
     if (want && veneer_enabled() && g_slot < 0 && kl_x18_init() != 0) return -1;
 
-    size_t   cap  = ((size_t)veneers * VEN_MAX_INSN * 4 + 0xFFFF) & ~(size_t)0xFFFF;
+    // ...plus what the jump-table rewrite can cost. A `br x18` that converts
+    // grows a thunk per table target, so it is the one site shape whose veneer
+    // is not VEN_MAX_INSN-bounded. Budgeting the worst case per `br x18` is
+    // cheap — there are single digits of them in a real library — and running
+    // short is not a crash, only a site that keeps the guarded veneer.
+    size_t   termbr = image && image->data_at ? kl_x18_count_termbr(code, size) : 0;
+    size_t   cap  = ((size_t)veneers * VEN_MAX_INSN * 4
+                     + termbr * KLX_JT_MAX_INSN * 4 + 0xFFFF) & ~(size_t)0xFFFF;
     uint8_t *base = NULL;
     // The caller's reservation first: it is the only placement that is adjacent
     // to the image by CONSTRUCTION rather than by luck. Searching is the
@@ -1061,8 +1344,8 @@ int kl_x18_patch(void *code, size_t size, void *arena, size_t arena_size,
     if (!base) base = klx_place_pool(code, size, cap);
     if (!base) return -1;
 
-    int rc = kl_x18_emit(code, size, (uint64_t)(uintptr_t)code,
-                         base, cap, (uint64_t)(uintptr_t)base, st, NULL);
+    int rc = kl_x18_emit_img(code, size, (uint64_t)(uintptr_t)code,
+                             base, cap, (uint64_t)(uintptr_t)base, image, st, NULL);
     st->pool_va    = (uint64_t)(uintptr_t)base;
     st->pool_bytes = cap;
 

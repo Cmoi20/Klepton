@@ -43,7 +43,32 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
 #define SHT_PROGBITS  1
 #define SHT_DYNSYM    11
 #define SHF_EXECINSTR 0x4
+#define SHF_WRITE     0x1
+#define SHF_ALLOC     0x2
 #define SHT_NOBITS 8
+// The image behind an executable chunk, for the `br x18` jump-table rewrite —
+// see kl_x18_image in kl_x18.h. `bias` turns a MAPPED address back into the
+// ELF's own VA, because at load time the addresses handed to the veneer pass are
+// the mapping's own.
+struct x18_img_ctx { const Elf64_Shdr *sh; int shnum; uint64_t bias; };
+
+// Read-only ALLOC data only. Executable would let a mis-recognition write over
+// code; writable (.data.rel.ro) is rewritten by relocations at load, which would
+// undo the repointing silently. A jump table is in .rodata.
+static void *x18_img_data_at(void *vctx, uint64_t va, size_t len) {
+    struct x18_img_ctx *c = vctx;
+    uint64_t gva = va - c->bias;
+    for (int i = 0; i < c->shnum; i++) {
+        const Elf64_Shdr *s = &c->sh[i];
+        if (s->sh_type != SHT_PROGBITS) continue;
+        if (s->sh_flags & (SHF_EXECINSTR | SHF_WRITE)) continue;
+        if (!(s->sh_flags & SHF_ALLOC) || !s->sh_addr) continue;
+        if (gva < s->sh_addr || gva + len > s->sh_addr + s->sh_size) continue;
+        return (void *)(uintptr_t)va;      // the mapping is contiguous from `lo`
+    }
+    return NULL;
+}
+
 #define PT_LOAD 1
 #define PT_DYNAMIC 2
 #define PT_GNU_RELRO 0x6474e552
@@ -1036,6 +1061,11 @@ kl_image *kl_load(const char *path) {
         if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
         if (sh[i].sh_offset + sh[i].sh_size > (uint64_t)sb.st_size) continue;
         x18_arena += (size_t)kl_x18_count(file + sh[i].sh_offset, (size_t)sh[i].sh_size);
+        // ...plus the jump-table rewrite's worst case per `br x18`, the one site
+        // shape whose veneer grows a thunk per table target.
+        x18_arena += (size_t)kl_x18_count_termbr(file + sh[i].sh_offset,
+                                                 (size_t)sh[i].sh_size)
+                   * (KLX_JT_MAX_INSN / KLX_VEN_MAX_INSN + 2);
     }
     if (x18_arena) {
         // Per-chunk pools each round up to 64 KB and one section can be several
@@ -1129,6 +1159,15 @@ kl_image *kl_load(const char *path) {
                             ? img->base - img->map_off + img->map_size : NULL;
     size_t   x18_arena_used = 0;
 
+    // The image behind each chunk, so the `br x18` jump-table rewrite can reach
+    // the table it has to repoint. Here the chunk addresses ARE the mapped
+    // addresses, so resolving is only a bounds check against the section that
+    // owns the VA — and the section must be read-only ALLOC data: executable
+    // would let a mis-recognition write over code, and writable is rewritten by
+    // relocations, which would undo the repointing without a word.
+    struct x18_img_ctx ictx = { sh, eh->e_shnum, (uint64_t)(uintptr_t)img->base - lo };
+    kl_x18_image ximg = { x18_img_data_at, &ictx };
+
     for (int i = 0; sh && i < eh->e_shnum; i++) {
         if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
         uint64_t cursor = sh[i].sh_addr, cva;
@@ -1140,11 +1179,21 @@ kl_image *kl_load(const char *path) {
             if (!veneer) continue;
             kl_x18_stats xs;
             if (kl_x18_patch(p, csz, x18_arena_base, img->x18_arena_size,
-                             &x18_arena_used, &xs) != 0) {
+                             &x18_arena_used, &ximg, &xs) != 0) {
                 fprintf(stderr, "  [klepton] %s: x18 veneering failed to start\n", path);
                 veneer = 0;
                 continue;
             }
+            // The jump-table rewrite, both halves. A CONVERTED `br x18` no
+            // longer branches through x18 at all and cannot be killed by the
+            // kernel zeroing it; a FALLBACK one still can, and that residual is
+            // a silent SIGKILL on device — so it is printed rather than left to
+            // be inferred from silence.
+            if (xs.jt_sites || xs.jt_fallback)
+                fprintf(stderr, "  [klepton] %s: br x18 — %u converted to thunk "
+                                "dispatch (%u targets), %u on the guarded veneer%s\n",
+                        path, xs.jt_sites, xs.jt_thunks, xs.jt_fallback,
+                        xs.jt_fallback ? " (residual x18 window)" : "");
             // A REFUSED x18 site runs against Darwin's reserved x18, which is
             // zero after any exception return, and it has no other error
             // surface: libUE4's 8038 sites all refused for REACH surface as an

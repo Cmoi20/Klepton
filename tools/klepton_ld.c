@@ -49,6 +49,8 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
 #define PF_W          2
 #define SHT_PROGBITS  1
 #define SHF_EXECINSTR 0x4
+#define SHF_WRITE     0x1
+#define SHF_ALLOC     0x2
 
 #define PAGE 0x4000ull                 // 16 KB — Apple's page on arm64
 #define HDR_RESERVE 0x4000ull          // room for the Mach-O header and load commands
@@ -72,6 +74,36 @@ static void die(const char *fmt, ...) {
 // the .bss tail has no bytes here to patch, and answering NULL for it is the
 // same "not in this image" the header already defines.
 struct gp_ctx_shape { uint8_t *img; const Elf64_Phdr *ph; int n; };
+
+// The image behind a chunk, for the `br x18` jump-table rewrite. It has to reach
+// the TABLE, which lives in .rodata and so in a different section from the code
+// being veneered. `shift` is the VA offset the Mach-O layout applies, because
+// everything handed to kl_x18_emit is in the shifted (runtime) space while the
+// section headers are in the ELF's own.
+struct x18_img_ctx {
+    uint8_t          *img;
+    const Elf64_Shdr *sh;
+    int               shnum;
+    uint64_t          shift;
+};
+
+// Read-only ALLOC data only, and that restriction is load-bearing twice over: an
+// executable section would let a mis-recognition write over code, and a WRITABLE
+// one (.data.rel.ro) is rewritten by relocations at load, which would undo the
+// repointing silently. A jump table is in .rodata.
+static void *x18_data_at(void *vctx, uint64_t va, size_t len) {
+    struct x18_img_ctx *c = vctx;
+    uint64_t gva = va - c->shift;
+    for (int i = 0; i < c->shnum; i++) {
+        const Elf64_Shdr *s = &c->sh[i];
+        if (s->sh_type != SHT_PROGBITS) continue;
+        if (s->sh_flags & (SHF_EXECINSTR | SHF_WRITE)) continue;
+        if (!(s->sh_flags & SHF_ALLOC) || !s->sh_addr) continue;
+        if (gva < s->sh_addr || gva + len > s->sh_addr + s->sh_size) continue;
+        return c->img + s->sh_offset + (gva - s->sh_addr);
+    }
+    return NULL;
+}
 static uint32_t *gp_at(void *ctx, uint64_t va) {
     struct gp_ctx_shape *c = (struct gp_ctx_shape *)ctx;
     for (int i = 0; i < c->n; i++) {
@@ -214,7 +246,7 @@ int main(int argc, char **argv) {
     if (!img) die("out of memory");
     memcpy(img, f, (size_t)sb.st_size);
 
-    unsigned tls_rewrites = 0, tls_refused = 0, x18_sites = 0;
+    unsigned tls_rewrites = 0, tls_refused = 0, x18_sites = 0, x18_termbr = 0;
     const Elf64_Shdr *sh = (eh->e_shoff && eh->e_shnum)
                          ? (const Elf64_Shdr *)(f + eh->e_shoff) : NULL;
     if (!sh) die("%s has no section headers — cannot separate code from rodata "
@@ -247,6 +279,7 @@ int main(int argc, char **argv) {
             uint8_t *p = img + sh[i].sh_offset + (cva - sh[i].sh_addr);
             tls_rewrites += rewrite_tls(p, csz, cva, &tls_refused);
             x18_sites    += kl_x18_count(p, csz);
+            x18_termbr   += kl_x18_count_termbr(p, csz);
         }
     }
     if (text_lo == UINT64_MAX) text_lo = text_hi = 0;
@@ -259,7 +292,13 @@ int main(int argc, char **argv) {
     // the furthest any site can be from the pool is the image's own span, and
     // the largest guest library here is libil2cpp at 57 MB.
     uint64_t pool_va   = HDR_RESERVE;                       // right after the header
-    uint64_t pool_cap  = (uint64_t)x18_sites * KLX_VEN_MAX_INSN * 4;
+    // ...plus the jump-table rewrite's worst case per `br x18`. That is the one
+    // site shape whose veneer grows with the guest — a thunk per table target —
+    // and it is a handful of sites per library, so budgeting the maximum costs
+    // nothing worth measuring. Running short is not a failure, only a `br x18`
+    // that keeps the guarded veneer and its residual window.
+    uint64_t pool_cap  = (uint64_t)x18_sites * KLX_VEN_MAX_INSN * 4
+                       + (uint64_t)x18_termbr * KLX_JT_MAX_INSN * 4;
     uint64_t image_shift = align_up(pool_va + pool_cap, PAGE);
 
     // ...and then the shift is CHOSEN, not merely made large enough, because a
@@ -397,6 +436,8 @@ int main(int argc, char **argv) {
     // buffers here are a file image, not a mapping.
     kl_x18_stats x18st = {0};
     uint64_t pool_off = 0;
+    struct x18_img_ctx ictx = { img, sh, eh->e_shnum, image_shift };
+    kl_x18_image ximg = { x18_data_at, &ictx };
     for (int i = 0; i < eh->e_shnum && pool_cap; i++) {
         if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
         uint64_t cursor = sh[i].sh_addr, cva;
@@ -405,10 +446,10 @@ int main(int argc, char **argv) {
                                 skip, nskip, &cursor, &cva, &csz)) {
             kl_x18_stats st;
             size_t used = 0;
-            if (kl_x18_emit(img + sh[i].sh_offset + (cva - sh[i].sh_addr), csz,
-                            image_shift + cva,
-                            pool + pool_off, (size_t)(pool_cap - pool_off),
-                            pool_va + pool_off, &st, &used) != 0)
+            if (kl_x18_emit_img(img + sh[i].sh_offset + (cva - sh[i].sh_addr), csz,
+                                image_shift + cva,
+                                pool + pool_off, (size_t)(pool_cap - pool_off),
+                                pool_va + pool_off, &ximg, &st, &used) != 0)
                 die("x18 veneer emission failed for section %d", i);
             x18st.sites       += st.sites;
             x18st.patched     += st.patched;
@@ -416,17 +457,29 @@ int main(int argc, char **argv) {
             x18st.ctr_sites   += st.ctr_sites;
             x18st.ctr_patched += st.ctr_patched;
             x18st.ctr_refused += st.ctr_refused;
+            x18st.jt_sites    += st.jt_sites;
+            x18st.jt_thunks   += st.jt_thunks;
+            x18st.jt_fallback += st.jt_fallback;
             pool_off          += used;
         }
     }
     if (x18st.refused) {
         // Same posture as the runtime loader: a refused site keeps its raw x18
-        // reads Darwin's, so it is reported rather than hidden. The
-        // two known ones are libunity's `br x18` jump tables.
+        // reads Darwin's, so it is reported rather than hidden.
         fprintf(stderr, "klepton-ld: %s: %u of %u x18 sites refused — these "
                         "read Darwin's reserved x18:\n", in, x18st.refused, x18st.sites);
         kl_x18_report(stderr);
     }
+    // The jump-table rewrite, announced whenever there is a `br x18` at all —
+    // both halves of it. A CONVERTED site no longer branches through x18 and so
+    // cannot be killed by the kernel zeroing it; a FALLBACK site still can, and
+    // on device that is a SIGKILL with no report, so it must never be a silent
+    // zero.
+    if (x18st.jt_sites || x18st.jt_fallback)
+        fprintf(stderr, "klepton-ld: %s: br x18 — %u converted to thunk dispatch "
+                        "(%u targets), %u left on the guarded veneer%s\n",
+                in, x18st.jt_sites, x18st.jt_thunks, x18st.jt_fallback,
+                x18st.jt_fallback ? " (those keep the residual x18 window)" : "");
     // The CTR_EL0 half is louder than the x18 half because the failure is
     // immediate: a
     // `mrs Xt, CTR_EL0` left alone is SIGILL the first time it executes, not a
