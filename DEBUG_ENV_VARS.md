@@ -2604,6 +2604,20 @@ written down is a value found twice.
   ceiling costs memory and per-frame GPU time; the *running* quality is set
   separately by the render loop.
 
+### `Documents/klepton-env.txt` — settings without a rebuild
+
+`<container>/klepton-env.txt`: `NAME=VALUE` per line, `#` comments, read by
+`kl_app_configure` FIRST and applied with overwrite (it wins over every
+`setenv(...,0)` default); each line is logged as `[env-file]`. Absent =
+nothing happens. Because configure runs before the boot log opens,
+`kl_app_boot` repeats it into the log: `[env-file] applied: NAME=VALUE …` (or
+`(none)`) — so a Home View launch's log says what it ran with. Push it
+between launches:
+
+    xcrun devicectl device copy to --device <udid> --domain-type appDataContainer \
+      --domain-identifier <bundle id> --source klepton-env.txt \
+      --destination Documents/klepton-env.txt
+
 ## Wrapper-script control vars (`visionos/run.sh`, `build_run_vpro.sh`)
 
 Read by the scripts themselves, never forwarded to the app.

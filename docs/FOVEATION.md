@@ -678,7 +678,19 @@ back to its original source and turns foveation off.
 ## 10. Turning it on
 
 `KL_FOVEATION=off|low|medium|high` (default `off`), from the environment
-(`visionos/run.sh` forwards every `KL_*` variable into the app it launches). With no rate-map support the runtime logs one line and
+(`visionos/run.sh` forwards every `KL_*` variable into the app it launches)
+or, for a launch from the Home View, from `Documents/klepton-env.txt` in the
+app's data container (`NAME=VALUE` per line, read before anything else and
+winning over the environment; see `DEBUG_ENV_VARS.md`). For example:
+
+    KL_FOVEATION=high
+    KL_FOVE_BOX=0.30
+    KL_FOVE_FLOOR=0.08
+
+pushed with `xcrun devicectl device copy to --domain-type appDataContainer
+--domain-identifier <bundle id> --source klepton-env.txt --destination
+Documents/klepton-env.txt`; the boot log's `[env-file] applied: …` line
+confirms what the run picked up. With no rate-map support the runtime logs one line and
 runs unfoveated; with no 2-layer support, 2-layer eye pairs stay unfoveated.
 
 Lines that prove engagement (all prefixed `[fove]` or `[vk] [fove]`):
