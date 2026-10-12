@@ -639,6 +639,70 @@ static uint32_t reenc_adrp(uint32_t w, uint64_t oldpc, uint64_t newpc, int *ok) 
     return (w & ~((0x7ffffu << 5) | (3u << 29))) | ((v >> 2) << 5) | ((v & 3) << 29);
 }
 
+// ---------- pc-relative WRITES: adr / ldr-literal ----------
+//
+// These two were refused from the beginning because `klx_substitute` alone
+// cannot move them: `adr` reaches +/-1 MB and the literal form the same, while
+// the veneer pool sits up to 128 MB away. `reenc_adrp` rescues `adrp`, and
+// there was no equivalent for these.
+//
+// **A refused WRITE is not a site left merely broken — it is a site that
+// corrupts every later READ.** The unpatched instruction writes Darwin's real
+// x18 while the shadow in tsd[KLX_TSD_SLOT] keeps whatever the last veneered
+// write put there, and the next veneered read hands the guest that stale value.
+// FNAF: Help Wanted 1 died exactly here, in `vorbis_synthesis_blockin`:
+//
+//     6ac82f8: cset w18, ls        veneered   -> shadow := 1
+//     6ac8358: adr  x18, 0x6ac8810 REFUSED    -> real x18 := &pool, shadow still 1
+//     6ac8364: ldr  q4, [x18]      veneered   -> loads from address 0x1  ** SIGSEGV **
+//
+// on four audio pool threads at once. Nothing in the log named it, because the
+// veneer did precisely what it was told.
+//
+// The fix is to stop trying to relocate the instruction and instead compute the
+// address it WOULD have produced. Both targets are known at emit time and both
+// are reachable by `adrp` (+/-4 GB), so:
+//
+//     adr x18, T   ->   adrp b, page(T) ; add b, b, #off(T)  ; str b, [shadow]
+//     ldr w18, T   ->   adrp b, page(T) ; ldr wb, [b,#off(T)] ; str b, [shadow]
+//
+// `off(T)` is `T & 0xfff`, always in range for the scaled unsigned offset
+// (< 4096) and preserving the literal's natural alignment, since `adrp` clears
+// exactly those low twelve bits. Seven instructions either way, inside
+// KLX_VEN_MAX_INSN.
+//
+// This is sound only because the whole ELF image is shifted UNIFORMLY into
+// __TEXT (see the image-shift line klepton-ld prints): the byte a pc-relative
+// operand named in the ELF is the same byte at the same relative distance in
+// the Mach-O, so `spc`/`vpc` arithmetic on the laid-out addresses lands on it.
+static uint32_t enc_adrp_to(unsigned t, uint64_t from, uint64_t target, int *ok) {
+    int64_t d = ((int64_t)(target & ~0xFFFULL) - (int64_t)(from & ~0xFFFULL)) >> 12;
+    if (d < -(1LL << 20) || d >= (1LL << 20)) { *ok = 0; return 0; }
+    *ok = 1;
+    uint32_t v = (uint32_t)((uint64_t)d & 0x1fffff);
+    return 0x90000000u | ((v & 3) << 29) | ((v >> 2) << 5) | t;
+}
+static uint32_t enc_add_imm(unsigned d, unsigned n, unsigned imm12) {   // add xD, xN, #imm
+    return 0x91000000u | ((imm12 & 0xfff) << 10) | (n << 5) | d;
+}
+static uint32_t enc_ldr_w(unsigned t, unsigned n, unsigned off) {       // ldr wT, [xN, #off]
+    return 0xB9400000u | ((off / 4) << 10) | (n << 5) | t;
+}
+static uint32_t enc_ldrsw(unsigned t, unsigned n, unsigned off) {       // ldrsw xT, [xN, #off]
+    return 0xB9800000u | ((off / 4) << 10) | (n << 5) | t;
+}
+
+// `adr Xd, label`: imm21 is immhi[23:5]:immlo[30:29], a BYTE displacement.
+static uint64_t adr_target(uint32_t w, uint64_t pc) {
+    int64_t imm = (int64_t)((((uint64_t)(w >> 5) & 0x7ffff) << 2) | ((w >> 29) & 3));
+    return pc + (uint64_t)((imm << 43) >> 43);
+}
+// `ldr Wt/Xt, label` / `ldrsw Xt, label`: imm19 at [23:5], scaled by 4.
+static uint64_t lit_target(uint32_t w, uint64_t pc) {
+    int64_t imm = (int64_t)((w >> 5) & 0x7ffff);
+    return pc + (uint64_t)(((imm << 45) >> 45) << 2);
+}
+
 static uint64_t br_target(uint32_t w, uint64_t pc, unsigned kind) {
     int64_t imm = (kind == KLX_PC_CBZ) ? (int64_t)((w >> 5) & 0x7ffff)
                                        : (int64_t)((w >> 5) & 0x3fff);
@@ -1152,11 +1216,58 @@ int kl_x18_emit_img(void *code, size_t size, uint64_t code_va,
             continue;
         }
 
-        if (in.hazard || in.pcrel == KLX_PC_ADR || in.pcrel == KLX_PC_LITERAL ||
-            out + VEN_MAX_INSN > pool_end) { note_refusal(word); st->refused++; continue; }
+        if (out + VEN_MAX_INSN > pool_end) { note_refusal(word); st->refused++; continue; }
+
+        if (in.hazard) { note_refusal(word); st->refused++; continue; }
 
         unsigned a, b;
         pick_scratch(in.gp_used, &a, &b);
+
+        // The two pc-relative WRITES, rebuilt rather than relocated. See the
+        // block comment above enc_adrp_to for why a refusal here is worse than
+        // a refusal anywhere else in this loop.
+        if (in.pcrel == KLX_PC_ADR || in.pcrel == KLX_PC_LITERAL) {
+            uint32_t body[VEN_MAX_INSN], patch;
+            unsigned k = 0;
+            int ok = 1;
+            uint64_t target = (in.pcrel == KLX_PC_ADR) ? adr_target(word, spc)
+                                                       : lit_target(word, spc);
+            unsigned off = (unsigned)(target & 0xfff);
+
+            body[k++] = enc_stp(a, b, -16);
+            body[k++] = enc_mrs_tpidrro(a);
+            body[k]   = enc_adrp_to(b, vpc + k * 4, target, &ok); k++;
+            if (in.pcrel == KLX_PC_ADR) {
+                body[k++] = enc_add_imm(b, b, off);
+            } else {
+                switch ((word >> 30) & 3) {
+                case 0:  body[k++] = enc_ldr_w(b, b, off); break;   // ldr  w18
+                // The scaled offset needs the literal 8-byte aligned. Compilers
+                // align 64-bit literals naturally; one that is not is refused
+                // rather than loaded from the wrong address.
+                case 1:  body[k++] = enc_ldr(b, b, off);                // ldr  x18
+                         if (off & 7) ok = 0;
+                         break;
+                case 2:  body[k++] = enc_ldrsw(b, b, off); break;   // ldrsw x18
+                default: ok = 0; break;                             // prfm: not a site
+                }
+            }
+            body[k++] = enc_str(b, a, (unsigned)KLX_TSD_SLOT * 8);
+            body[k++] = enc_ldp(a, b, -16);
+            ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
+            ok &= (k <= VEN_MAX_INSN);
+            ok &= enc_b(spc, vpc, &patch);
+            if (!ok) {
+                note_refusal(word); st->refused++;
+                if (out_of_reach(spc, vpc)) st->far_refused++;
+                continue;
+            }
+            memcpy(out, body, k * 4);
+            out += k;
+            w[i] = patch;
+            st->patched++;
+            continue;
+        }
 
         uint32_t body[VEN_MAX_INSN];
         unsigned k = 0;
