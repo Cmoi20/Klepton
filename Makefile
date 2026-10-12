@@ -435,6 +435,14 @@ build/t_x18: tests/t_x18.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_x18.c runtime/kl_x18.c runtime/kl_env.c
 
+# klepton-ld's SPLIT veneer placement (two pools, per-slice choice, halving that
+# keeps odd-word tails instruction-aligned) on a synthetic sparse library wider
+# than two `b` windows — no host tree carries one (Deadpool VR's libUE4 is the
+# real case). Also run by `make check`.
+.PHONY: ldsplit
+ldsplit: build/klepton-ld
+	python3 tests/t_ld_split.py build/klepton-ld build/ldsplit
+
 x18: build/t_x18
 	python3 tools/check_x18.py build/t_x18 $(foreach f,$(GUEST_LIBS),$(LIBS)/$(f).so)
 
@@ -550,10 +558,12 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps build/t_x18race
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps build/t_x18race build/klepton-ld
 	@echo "=== variadic ABI ===" && ./build/t_variadic
 	@./build/t_x18race > build/x18race.log 2>&1 || { cat build/x18race.log; exit 1; }
 	@head -1 build/x18race.log && tail -1 build/x18race.log
+	@python3 tests/t_ld_split.py build/klepton-ld build/ldsplit > build/ldsplit.log 2>&1 || { cat build/ldsplit.log; exit 1; }
+	@echo "=== klepton-ld SPLIT placement (synthetic 300 MB library) ===" && tail -1 build/ldsplit.log
 	@echo "=== crash reporter ===" && ./build/t_fault
 	@echo "=== GL limits vs ANGLE ===" && ./build/t_glcaps vendor/out/Debug
 	@./build/t_hevc > build/hevc.log 2>&1 || { cat build/hevc.log; exit 1; }
