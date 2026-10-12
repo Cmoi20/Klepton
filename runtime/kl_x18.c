@@ -1218,6 +1218,57 @@ int kl_x18_emit_img(void *code, size_t size, uint64_t code_va,
 
         if (out + VEN_MAX_INSN > pool_end) { note_refusal(word); st->refused++; continue; }
 
+        // `blr x18` — the one hazard shape that IS separable, for the mirror of
+        // the reason `br x18` is. It cannot simply fall through the veneer (the
+        // callee would return into the pool with x30 naming a veneer address,
+        // which no unwinder recognises), but the return address is a constant at
+        // emit time, so the veneer can SET x30 itself and finish with a `br`.
+        //
+        // The branch must not go through x18. Darwin zeroes x18 on an exception
+        // return, so loading the target into x18 and running the x30 setup
+        // before `br x18` would leave the widest window in the pool, with no
+        // guard. Half-Life: Alyx's mpg123 (a `blr x18` per granule in
+        // INT123_do_layer3, every few microseconds on an audio thread) hits
+        // exactly that in two runs of two: signal 11, pc 0, the shadow holding
+        // the right target. A call site may clobber x16/x17 (AAPCS64 IP0/IP1:
+        // every linker veneer and PLT stub does), so the target goes through
+        // x16, which the kernel never touches, and x18 gets a copy:
+        //
+        //      mrs  x16, tpidrro_el0
+        //      ldr  x16, [x16, #slot]      the target
+        //      mov  x18, x16               what a native blr leaves in x18
+        //      adrp x17, page(spc + 4)
+        //      add  x30, x17, #off(spc + 4)  ...which is what `blr` would set
+        //      br   x16                    (BTI: br x16 may land on `bti c`)
+        //
+        // No spill is needed, and the shadow is untouched, so the guest's view
+        // of x18 stays what a native `blr x18` would have left.
+        if (in.hazard == KLX_HZ_NOFALL && (word & 0xFFFFFC1Fu) == 0xD63F0000u
+            && ((word >> 5) & 31) == 18) {
+            uint32_t body[VEN_MAX_INSN], patch;
+            unsigned k = 0;
+            int ok = 1;
+            uint64_t ret = spc + 4;
+            body[k++] = enc_mrs_tpidrro(16);
+            body[k++] = enc_ldr(16, 16, (unsigned)KLX_TSD_SLOT * 8);
+            body[k++] = 0xAA1003F2u;                       // mov x18, x16
+            body[k]   = enc_adrp_to(17, vpc + k * 4, ret, &ok); k++;
+            body[k++] = enc_add_imm(30, 17, (unsigned)(ret & 0xfff));
+            body[k++] = 0xD61F0200u;                       // br x16
+            ok &= (k <= VEN_MAX_INSN);
+            ok &= enc_b(spc, vpc, &patch);
+            if (!ok) {
+                note_refusal(word); st->refused++;
+                if (out_of_reach(spc, vpc)) st->far_refused++;
+                continue;
+            }
+            memcpy(out, body, k * 4);
+            out += k;
+            w[i] = patch;
+            st->patched++;
+            continue;
+        }
+
         if (in.hazard) { note_refusal(word); st->refused++; continue; }
 
         unsigned a, b;
