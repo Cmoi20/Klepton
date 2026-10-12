@@ -85,7 +85,7 @@ RUNTIME_HDRS := $(RUNTIME_ALL_HDRS) $(wildcard tests/*.h) \
                 runtime/data/phonon_hrtf_cipic_124.sofa \
                 runtime/data/kl_menu_font.ttf
 
-.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
+.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest x18race
 all: build/t_opus
 
 build/t_opus: tests/t_opus.c $(RUNTIME) $(RUNTIME_HDRS)
@@ -438,6 +438,16 @@ build/t_x18: tests/t_x18.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 x18: build/t_x18
 	python3 tools/check_x18.py build/t_x18 $(foreach f,$(GUEST_LIBS),$(LIBS)/$(f).so)
 
+# The `br x18` veneer's race windows, manufactured and executed so the fix can
+# be checked somewhere other than a headset. Seeds the TSD slot through
+# kl_thread_init, so it links the runtime.
+build/t_x18race: tests/t_x18race.c $(RUNTIME) runtime/kl_x18.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_x18race.c $(RUNTIME) $(LDLIBS)
+
+x18race: build/t_x18race
+	./build/t_x18race
+
 # The CTR_EL0 veneer, EXECUTED. Same shape as t_x18: linked against
 # the decoder alone, so a veneer bug cannot hide behind a working loader. It
 # runs the real illegal instruction in a child as its control, which is why the
@@ -540,8 +550,10 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps build/t_x18race
 	@echo "=== variadic ABI ===" && ./build/t_variadic
+	@./build/t_x18race > build/x18race.log 2>&1 || { cat build/x18race.log; exit 1; }
+	@head -1 build/x18race.log && tail -1 build/x18race.log
 	@echo "=== crash reporter ===" && ./build/t_fault
 	@echo "=== GL limits vs ANGLE ===" && ./build/t_glcaps vendor/out/Debug
 	@./build/t_hevc > build/hevc.log 2>&1 || { cat build/hevc.log; exit 1; }

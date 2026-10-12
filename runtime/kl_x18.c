@@ -578,6 +578,12 @@ static uint32_t enc_str(unsigned t, unsigned n, unsigned off) {
     return 0xF9000000u | ((off / 8) << 10) | (n << 5) | t;
 }
 static uint32_t enc_mrs_tpidrro(unsigned t) { return 0xD53BD060u | t; }
+// cbz xT, #<insns> — a 64-bit compare-and-branch, offset in INSTRUCTIONS and
+// signed. Only ever emitted with a tiny negative offset here, so the imm19
+// range is not worth checking.
+static uint32_t enc_cbz(unsigned t, int32_t insns) {
+    return 0xB4000000u | (((uint32_t)insns & 0x7FFFFu) << 5) | t;
+}
 static uint32_t enc_movz(unsigned t, uint16_t imm, unsigned shift16) {  // movz xT, #imm, lsl #(16*s)
     return 0xD2800000u | ((uint32_t)shift16 << 21) | ((uint32_t)imm << 5) | t;
 }
@@ -807,6 +813,46 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
         // It is also self-identifying if it ever fires: a fault at address 0 with
         // pc 0 and a guest frame above it is this and essentially nothing else,
         // because a jump-table target is never address 0.
+        //
+        // The `ldr`/`br` window is NARROWED by a load-use guard:
+        //
+        //     V+0   mrs  x18, tpidrro_el0
+        //     V+4   ldr  x18, [x18, #slot]
+        //     V+8   cbz  x18, V+0
+        //     V+12  br   x18
+        //
+        // The guard does not remove the fatal slot — nothing can, for the reason
+        // written above — but it makes that slot far narrower, and the mechanism
+        // is worth stating because it is the whole argument for the instruction.
+        //
+        // An interrupt is taken against the OLDEST un-retired instruction, so a
+        // slot's exposure is the TIME the pipeline spends with that instruction
+        // at the head, not one cycle. Without the guard, `br x18` sits directly
+        // on the result of a TSD load and stalls there for the load's whole
+        // load-use latency — the fatal slot is the widest one in the veneer.
+        // The `cbz` absorbs that stall: it is the instruction that waits for
+        // x18, and by the time the `br` issues the value is already in hand, so
+        // the `br` retires immediately. The stall moves from the fatal slot to a
+        // RECOVERABLE one — an interrupt landing on the `cbz` zeroes x18, the
+        // cbz sees the zero and jumps back to the `mrs`, and the veneer simply
+        // reloads. No signal, no handler, no cost on the path that does not
+        // race.
+        //
+        // The difference is measurable. Arizona Sunshine 2's FMOD mixer
+        // dispatches through a 32-way jump table (libfmod.so+0x85628) on every
+        // mix buffer. On the macOS host the unguarded veneer collected 100+
+        // `mrs`/`ldr`-window faults in ten minutes and no `br`-window death; on
+        // the headset — a real-time audio thread woken on a fixed period, so its
+        // preemptions are not randomly phased — the `br` window killed the
+        // title about 38 seconds in, two runs out of two.
+        //
+        // If x18 reads back zero because the TSD slot GENUINELY holds zero, the
+        // guard spins instead of branching to 0. That is a guest asking to
+        // branch to address 0, which is a guest bug either way; a spin is at
+        // least a live process with a stack to look at, where a `br` to 0 on
+        // visionOS is an unblockable SIGKILL (CODESIGNING / "Invalid Page"),
+        // with no signal delivered and no handler able to see it. It has never
+        // been observed.
         if (in.hazard == KLX_HZ_TERMBR) {
             if (out + VEN_MAX_INSN > pool_end) {
                 note_refusal(word); st->refused++; continue;
@@ -815,6 +861,9 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
             unsigned k = 0;
             body[k++] = enc_mrs_tpidrro(18);
             body[k++] = enc_ldr(18, 18, (unsigned)KLX_TSD_SLOT * 8);
+            // The load-use guard (see above): this instruction is what moves the
+            // load-use stall off the `br`, and it recovers the slot it lands on.
+            body[k++] = enc_cbz(18, -2);       // x18 zeroed under us -> redo the mrs
             body[k++] = word;                  // br x18, against the loaded value
             if (!enc_b(spc, vpc, &patch)) {
                 note_refusal(word); st->refused++;
