@@ -516,9 +516,16 @@ static void *heartbeat(void *arg) {
             clock_gettime(CLOCK_REALTIME, &ts);
             struct tm tm;
             localtime_r(&ts.tv_sec, &tm);
-            fprintf(stderr, "[hb] %02d:%02d:%02d  phase=%s  foot=%lldM avail=%lldM\n",
+            // The x18 refusal count rides the heartbeat because the failure it
+            // predicts cannot report itself: a refused site that writes x18
+            // leaves the shadow stale, and the fault that follows can be a
+            // silent SIGKILL. Printed only when non-zero.
+            unsigned x18ref = kl_x18_refusals();
+            fprintf(stderr, "[hb] %02d:%02d:%02d  phase=%s  foot=%lldM avail=%lldM",
                     tm.tm_hour, tm.tm_min, tm.tm_sec, phase,
                     kl_phys_footprint() >> 20, kl_avail_memory() >> 20);
+            if (x18ref) fprintf(stderr, "  x18-REFUSED=%u", x18ref);
+            fprintf(stderr, "\n");
             fflush(stderr);
             last_phase = phase;
         }
