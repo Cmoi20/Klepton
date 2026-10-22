@@ -226,4 +226,10 @@ unsigned long long kl_vulkan_xr_image(unsigned w, unsigned h, unsigned layers,
 // be exported.
 void *kl_vulkan_xr_image_mtl(unsigned long long image);
 
+// t_fove: the foveated-intermediate refusal when an indirect draw recorded in a
+// SECONDARY command buffer is played inside its multiview pass (MoltenVK splits
+// such a pass). Fake handles, no device needed. Returns failed checks, -1 when
+// foveation is off or there are no MoltenVK headers.
+int kl_vulkan_fove_indirect_selftest(void);
+
 #endif

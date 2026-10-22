@@ -124,8 +124,47 @@ static int missing(const char *what, const char *path) {
     return 1;
 }
 
+// <container>/klepton-env.txt: NAME=VALUE per line, `#` comments. A launch
+// from the Home View has no environment at all, and a baked default needs a
+// rebuild; this file is pushed with `devicectl device copy to` between
+// launches, so a knob (foveation, render scale, an A/B) is one file copy and a
+// relaunch. Applied FIRST and with overwrite, so it wins over every
+// setenv(...,0) default; each line is said out loud. Absent file = nothing
+// happens.
+// What kl_env_file_apply set, kept so kl_app_boot can repeat it into the boot
+// log: configure runs before open_log, so the lines above reach only the
+// console, and a Home View launch has none.
+static char g_env_file_applied[1024];
+
+static void kl_env_file_apply(const char *container) {
+    char path[1200], line[512];
+    snprintf(path, sizeof path, "%s/klepton-env.txt", container);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        size_t n = strlen(s);
+        while (n && (s[n-1] == '\n' || s[n-1] == '\r' || s[n-1] == ' ')) s[--n] = 0;
+        if (!*s || *s == '#') continue;
+        char *eq = strchr(s, '=');
+        if (!eq || eq == s) {
+            fprintf(stderr, "  [env-file] \"%s\" is not NAME=VALUE — skipped\n", s);
+            continue;
+        }
+        *eq = 0;
+        setenv(s, eq + 1, 1);
+        fprintf(stderr, "  [env-file] %s=%s (klepton-env.txt)\n", s, eq + 1);
+        size_t at = strlen(g_env_file_applied);
+        snprintf(g_env_file_applied + at, sizeof g_env_file_applied - at,
+                 "%s%s=%s", at ? " " : "", s, eq + 1);
+    }
+    fclose(f);
+}
+
 int kl_app_configure(const char *resources, const char *container) {
     if (!resources || !container) return missing("path", "(null)");
+    kl_env_file_apply(container);
 
     const char *want = kl_env_str("KL_TARGET", KL_TARGET_DEFAULT);
     g_target = kl_target_lookup(want);
@@ -672,6 +711,10 @@ int kl_app_boot(void) {
 
     if (!*g_libdir) return fail("kl_app_configure was not called");
     if (open_log()) return fail("could not open the log file");
+    // The env-file lines were printed by kl_app_configure, before the log
+    // existed; repeat them here so the log says what it ran with.
+    fprintf(stderr, "  [env-file] applied: %s\n",
+            g_env_file_applied[0] ? g_env_file_applied : "(none)");
 
     // Every thread that runs guest code must seed bionic's stack-guard canary
     // into TSD slot 5 first, and this is the thread the whole boot runs on.
