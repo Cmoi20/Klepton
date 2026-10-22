@@ -572,9 +572,9 @@ The guest's own memory management, and the three seams that used to disable it.
   `IsHmdBatteryCharging()`/`GetHmdBatteryLevel()` and publishes them to the host
   as device properties, which the Steam client shows beside the headset. Nothing
   in the streaming path branches on them, so a wrong answer costs a wrong number
-  on someone's desktop. They are knobs because neither is measured yet — on
-  device the real values are available and wiring them is the honest fix; a
-  fixed answer at least does not fluctuate in the meantime.
+  on someone's desktop. The visionOS frontend normally publishes UIDevice's real
+  level and charging state; these knobs override those readings for diagnostics.
+  A host run, which has no device battery, keeps the 95% / not-charging fallback.
 
 ## Video decode (`runtime/media/kl_vtdec.c`, `runtime/media/kl_mediandk.c`)
 
@@ -2172,6 +2172,217 @@ vendored the whole path refuses by name and none of these do anything.
   `vendor-moltenvk/out/macos`); `KL_MVK_DYLIB=<path>` names the file outright.
   Both are the A/B against a different MoltenVK build.
 
+## Fixed foveation (`runtime/gfx/kl_fove.m`) — Vulkan guests, OFF by default
+
+Confirmed on the headset with Half-Life: Alyx, then extended to the Unity and
+Unreal eye shapes below. Design, measured facts and known gaps:
+`docs/FOVEATION.md`. GLES guests foveate through `KL_VRR` instead.
+
+Three eye shapes are recognised (all need `KL_FOVEATION` on; with it unset
+nothing is installed, swizzled or handed out, and kl_vulkan's render-pass
+records are never written):
+
+1. **OpenVR double-wide** (Half-Life: Alyx): a `vkCmdBeginRendering` pass whose
+   colour and depth are both the extent of the texture the guest Submits.
+   Needs an OpenVR runtime that reports that extent; none is in this tree yet,
+   so kl_fove carries the maths and the map but this shape is not recognised.
+2. **The runtime's own eye images** (every Unity/Unreal Vulkan guest): a `vkCmdBeginRenderPass[2]` pass whose colour attachment 0 IS
+   an eye image kl_ovrp (or kl_openxr) handed the guest, or whose resolve
+   attachment 0 is (an eye-size MSAA target resolved into the eye in the pass),
+   with a depth attachment of the same extent and sample count. A 2-layer
+   ARRAY eye (multiview, viewMask 0x3) gets ONE rate map with two layers, layer
+   l centred on eye l's projection centre (`kl_ovrp_eye_tangents`, which
+   kl_openxr's xrLocateViews also answers from; inside the submitted
+   ViewportRect when one is recorded) and is foveated only as a LAYERED Metal
+   pass (renderTargetArrayLength 2 — MoltenVK's lowering of multiview on Apple
+   GPUs); a one-slice pass over the pair draws unfoveated (counted). Every
+   patched shader passes `[[render_target_array_index]]` to the decoder (an
+   existing argument or stage_in member is reused, else one is added; Metal
+   answers 0 when the vertex stage does not write it). An MSAA pass that
+   resolves in-pass is expanded on the single-sample image it resolves into
+   (MoltenVK opens it with storeAction Unknown + resolveTexture); the expand
+   runs per slice. Measured on GORN 2 (host): 4x MSAA multiview colour+depth
+   resolved into the kl_ovrp swapchain, one layered encoder per frame.
+3. **The guest's own eye-size intermediate** (Batman: Arkham Shadow's render
+   pipeline; UE's SceneColor -> tonemap is the same family). The scene pass's
+   colour is NOT an eye image but is eye-sized (2 layers / viewMask 0x3 for a
+   pair, depth of the same extent and samples). (a) **In-pass**: a later
+   subpass of the SAME render pass writes (or resolves into) a runtime eye
+   image (Batman: Arkham Shadow: `#0 depth x2, #1 colour x2 DONT_CARE-stored, #2
+   R8G8B8A8_SRGB x1 STORE`, 3 subpasses, the post subpass reads #1 as an input
+   attachment). Marked at once: every Metal encoder of the pass (scene
+   subpasses and the eye subpass) gets the SAME 2-layer map; the scene stays in
+   physical layout (it is transient — required: its storeOp is DONT_CARE, the
+   eye attachment is not LOADed, all subpasses share one view mask), subpass
+   inputs read it at the physical position (the MSAA-eye rule), and the EYE image is
+   expanded after the pass. (b) **Copied / sampled later**: the pass's colour is
+   a CANDIDATE, confirmed (sticky until vkDestroyImage) by a
+   vkCmdCopyImage[2] / vkCmdBlitImage[2] / vkCmdResolveImage[2] into an eye
+   image, or by the next render pass that draws into an eye image (sampled —
+   a heuristic: that pass is assumed to read it). The confirming frame stays
+   unfoveated; afterwards the intermediate is marked like an eye and expanded
+   before the next render, compute **or blit** encoder (so its copy into the
+   eye reads screen layout). A layered MSAA intermediate with no in-pass
+   resolve stays unfoveated (counted, as for eyes).
+   **Size slack (Deadpool):** the intermediate need not be exactly
+   eye-size — equal or up to +16 px per axis, never smaller
+   (`kl_fove_inter_extent_ok`), because Unreal rounds its scene target up
+   (Deadpool: 5088x3236 scene for a 5088x3234 eye; the exact match left it
+   silently unfoveated, `fove high 0%`). The map is sized to the intermediate
+   (`[fove] map 5088x3236, 2 layer(s)`) and the expand runs on it (or on what it
+   resolves into), so the eye being smaller changes nothing downstream.
+   **Transient MSAA scene (Deadpool):** UE4's
+   depth-read subpass pair — `#0 colour x2 CLEAR/DONT_CARE, #1 x1
+   DONT_CARE/STORE, #2 depth x2`, subpass 0 draws the MSAA scene, subpass 1
+   LOADs it (depth read as an input) and resolves #0 into #1. MoltenVK opens
+   subpass 0 as a layered encoder that STORES the samples with no resolve,
+   which the rule above refused (`layered MSAA … UNFOVEATED`), and subpass 1
+   then LOADed with nothing pending (`a pass LOADs the eye …`) — both every
+   frame, `fove 0%`. When kl_vulkan sees the confirmed intermediate's colour
+   is storeOp DONT_CARE and a later subpass resolves it into a single-sample
+   attachment (`kl_fove_note_ms_transient`), the layered no-resolve encoder is
+   marked and its pending entry HELD (no expand; the samples die with the
+   pass), the LOADing resolve encoder is marked with the same map, and the
+   x1 resolve target is what gets expanded (the layered single-sample
+   expand), before the pass that samples it. No per-sample expand is needed.
+   Proof lines: `[vk] [fove] intermediate …: MSAA x2 scene with storeOp
+   DONT_CARE, resolved by a later subpass into attachment #1 (x1) …`, `[fove]
+   intermediate slot N: MSAA scene is TRANSIENT …`, `[fove] transient MSAA
+   intermediate: first HELD … encoder` + `first RESOLVING … encoder`, `[fove]
+   first expand: … x2 slices`, and in the 10 s line `transient MSAA held N /
+   resolved N` with `eye LOADs left unfoveated 0`, `layered MSAA without
+   resolve … 0`, `eye subpasses UNMAPPED 0`. A LOAD of held samples left
+   unmapped is a `BROKEN FRAME` (counted as UNMAPPED). A layered MSAA store
+   whose samples ARE kept (not DONT_CARE) still draws unfoveated: the
+   per-sample expand remains one-slice only.
+- **Re-centre on the frame record.** A layered (ARRAY) map built before the first frame record used the
+   full image for each eye's straight-ahead point; Deadpool renders each eye
+   into a ~4012-wide sub-rect of a 5088 texture, so the fovea sat 682 px off
+   (a hard clear/blurry seam in both eyes). `kf_map_for` now recomputes an
+   ARRAY map's centres on lookup and rebuilds it in place when one moves more
+   than **4 px** — never while a pending expand refers to it, at most 8 times
+   per run (old maps kept alive for frames in flight). Line: `[fove] map WxH
+   RE-CENTRED (#n): it was built at x,y / x,y — the frame record moved the
+   straight-ahead point …`; after the 8th, `… re-centres were already made —
+   kept`. Full-image records (Into the Radius, Batman: Arkham Shadow) give the same centre as no record
+   and never rebuild. No knob.
+
+- `KL_FOVEATION=off|low|medium|high` — default **off**. Profiles (box / floor,
+  ramp 0.19 H): low 0.603 H / 0.333, medium 0.508 H / 0.22, high 0.381 H /
+  0.125. No rate-map support (visionOS Simulator) = off with one line; no
+  2-layer support = 2-layer eye pairs stay unfoveated (one line). Logs `[fove]`.
+- **Lines that prove engagement on a Unity/OVRPlugin guest** (one run):
+  `[vk] [fove] EYE PASS (marked) render pass …: MSAA colour resolved into a
+  runtime eye image WxH x4 (2 layer(s), … viewMask 0x3) …`, `[fove] eye target
+  registered: … 2-layer eye pair`, `[fove] map WxH, 2 layer(s) (one per eye) …
+  layer 0 = eye 0 centre …` + `layer 1 = eye 1 centre …` (centres NOT 50%/50%
+  on the headset — asymmetric frusta; each centre names the
+  render viewport it came from, `…; viewport 0,0 WxH of WxH[, another
+  generation: scaled as a fraction]` or `…; no frame record: full image`),
+  `[fove] marked encoder #1: … + resolve
+  … array length 2`, `[fove] first expand: … x2 slices`, and every 10 s
+  `[fove] libraries …; encoders marked N (layered N) …, eye LOADs left
+  unfoveated 0, one-slice passes … 0, layered MSAA without resolve … 0;
+  expands N (… of a resolve target N marks …); refused 0 …`. A near miss is
+  named once with its full attachment table: `[vk] [fove] near miss, NOT
+  marked: … | why: …` (+ `[vk] [fove] near miss images: …`), and a transfer
+  into an eye image (the guest drew elsewhere) as `[vk] [fove] vkCmdBlitImage
+  INTO a runtime eye image …`.
+- **Map centre and the viewport generation.** The
+  per-eye centre is the frustum's straight-ahead fraction inside the guest's
+  render viewport, and that rect is now read as a FRACTION of the texture it
+  was measured against (`kl_ovrp_render_pose.viewport_of`), applied to the
+  image the map is built for. Read as pixels instead, a guest that re-creates
+  its eye images after the first frame (Into the Radius 5088x4081 -> 6784x4528;
+  Unity's ~1.2x resize and again on map entry) would get a map built from the
+  previous generation's rect — the fovea 848 px left / 204 px up, a blur band
+  on the right eye's outer edge. viewport_of 0 or a rect that does not fit it =
+  the full image. To check a guest that resizes its eye images: compare its
+  `[fove] map … centre` lines against W x fx, H x ~0.456 (the line's own
+  percentages), and the `of WxH` it names against the map's WxH.
+- `KL_FOVE_MSAA=0` — leave MSAA eyes UNFOVEATED (one `[vk] [fove] … MSAA`
+  line / near-miss reason). Default 1. MSAA paths: the depth-only
+  clear of a tiler-0 MSAA eye is mapped and leaves a depth_only pending entry;
+  2d_ms reads of an eye image at `gl_FragCoord` keep the PHYSICAL position;
+  an MSAA eye stored with no resolve is expanded per sample (resolve the
+  physical region, blit each fovea rectangle with all samples, periphery +
+  per-sample fovea back) — one slice only: a LAYERED MSAA pass that stores
+  its samples with no resolve draws unfoveated (counted). `KL_FOVE_MSAA_FOVEA=0`
+  (debug) — the per-sample fovea copy off.
+- `KL_FOVE_BOX=<fraction of H>`, `KL_FOVE_RAMP=<fraction of H>`,
+  `KL_FOVE_FLOOR=<rate 0.02..1>` — override the level's numbers (box 0.30 /
+  floor 0.08 was found invisible on the headset in Half-Life: Alyx).
+- `KL_FOVE_BUFFER=<1..30>` — the fragment buffer slot for the rate-map
+  parameters (default 20). A `[[position]]` shader already using it is
+  refused and foveation turns itself off; a clobber inside a foveated pass
+  does the same.
+- `KL_FOVE_FRAGCOORD=0|grid|gridraw` (debug) — unpatched shaders / a 64-px
+  position grid with or without the remap. `KL_FOVE_EXPAND=0` (debug) — leave
+  the eye in physical layout. `KL_FOVE_MSL_DUMP=<absolute dir>` (debug) —
+  every MSL source, as patched. `KL_FOVE_TRACE_ENC=<n>` (debug) —
+  the first n Metal render-pass descriptors after an eye is registered
+  (textures, types, sample counts, slices, load/store, resolve, array length).
+- `KL_FOVE_FENCE=0|1` — default **1** (confirmed on the headset with
+  Half-Life: Alyx). MoltenVK orders its passes with its own
+  MTLFences, so without this the guest's next reader of the eye can run
+  concurrently with the expand and see the raw physical (compressed) layout
+  (Half-Life: Alyx without it: shrunken copies of the scene in the top-left of
+  the left eye). Every expand path's last encoder updates a fence (`kl-fove-expand`;
+  the layered single-sample expand chains slice 0 -> slice 1 through a second
+  fence) and every render/compute/blit encoder opened afterwards on the same
+  queue waits on it (same command buffer at once; a later one once the
+  expand's buffer is committed). `0` = unordered (control). Proof lines:
+  `[fove] ON … expand ON (fenced: the guest's later passes wait for it)`,
+  `[fove] expand fence: the guest's encoders after an expand wait for it (first
+  wait: …)`, and every 10 s `[fove] expand fence: encoders
+  after an expand: waited on its own buffer N, on a later buffer N; NOT waited:
+  other buffer while the expand's was uncommitted N, other queue N; expands
+  recorded at an encoder N, at commit N`. "other queue" = an encoder on a
+  different MTLCommandQueue (no fence can order it — Metal fences are
+  per-queue; the swizzle is class-wide, so the runtime's own Metal work, e.g.
+  the compositor, is counted there too); non-zero "uncommitted" means the
+  guest encodes the reader into another command buffer before committing the
+  expand's — read it before anything else. The first expand also logs the eye
+  image's hazard tracking mode.
+- `KL_FOVE_INTERMEDIATE=0|1` — default **1** whenever `KL_FOVEATION` is on.
+  `0` = shape 3 above is never marked (the near-miss line of shape 2 comes
+  back). Proof lines (Batman: Arkham Shadow, in-pass): `[vk] [fove] intermediate CONFIRMED:
+  VkImage … -> eye image … via subpass (attachment #2 of render pass …)`,
+  `[vk] [fove] EYE PASS (marked) render pass …: eye-size intermediate, a later
+  subpass writes a runtime eye image …`, `[fove] intermediate target
+  registered: … via subpass …`, `[fove] intermediate slot N: eye image … is
+  written in-pass from it` (one per swapchain stage), `[fove] intermediate:
+  first marked scene encoder` + `first marked EYE-SUBPASS encoder`, `[fove]
+  first expand: … x2 slices`, and in the 10 s line `intermediate marked N (eye
+  subpasses N, eye subpasses UNMAPPED 0, expands before a blit N)`. Copy /
+  sampled shape: `[vk] [fove] intermediate CONFIRMED: … via copy|blit|resolve
+  (vkCmd…)` or `via sampled (…)` and `[fove] intermediate: expanded before a
+  blit encoder`. **`[fove] BROKEN FRAME: the eye subpass of a foveated
+  intermediate was left UNMAPPED`** (UNMAPPED > 0) = the picture is wrong
+  that frame — set `KL_FOVE_INTERMEDIATE=0` and bring the line back. The
+  transfer census line (`vkCmd… INTO a runtime eye image …`) now also names
+  the first region's layers/offsets/extent and whether the source is a
+  candidate/confirmed intermediate; the copy_commands2 spellings are hooked
+  too.
+- `KL_FOVE_PROBE=1` (debug) — the first 4 transfers of each kind into an eye
+  image (not just the first), and the first 4 depth-less passes drawing into
+  an eye image with the last candidate intermediate. It also swizzles MoltenVK's
+  render/compute encoder classes and prints every fence wait/update,
+  useResource, memory barrier, texture bind and dispatch on the 2 encoders
+  after each of the first 4 expands (`(THE EYE)` marks the eye), plus 10 s
+  totals. `KL_FOVE_SLOW=<n>` (debug stress) — n busy
+  iterations per fragment of the MSAA periphery expand, to widen the race
+  window (no effect on single-sample expands).
+- `KL_FOVE_AREA_SNAP=0|1` — default **1**. An eye pass whose render area
+  falls a few px (< 8) short of its framebuffer is widened to the whole
+  framebuffer: MoltenVK clears an attachment with a Metal clear only when the
+  render area IS the framebuffer extent, and otherwise opens it with LOAD, and
+  a pass that LOADs an eye with nothing foveated pending cannot be mapped.
+  Unreal rounds its scene buffer up (an area of 4608x2935 on a 4608x2936 eye);
+  without this every eye pass LOADed and nothing was foveated. The extra
+  rows/columns lie outside every viewport the guest submits. Line: `[vk] [fove]
+  area snap #1: eye pass area WxH widened to its framebuffer WxH …`.
+
 ## MoltenVK vendoring gate (`tests/t_mvk.c`, `make mvk-check`)
 
 The Vulkan side of BONELAB. Not part of the runtime yet —
@@ -2392,6 +2603,20 @@ written down is a value found twice.
 - `KL_CP_QUALITY=<0..1>` — the render quality to request (default 1.0). The
   ceiling costs memory and per-frame GPU time; the *running* quality is set
   separately by the render loop.
+
+### `Documents/klepton-env.txt` — settings without a rebuild
+
+`<container>/klepton-env.txt`: `NAME=VALUE` per line, `#` comments, read by
+`kl_app_configure` FIRST and applied with overwrite (it wins over every
+`setenv(...,0)` default); each line is logged as `[env-file]`. Absent =
+nothing happens. Because configure runs before the boot log opens,
+`kl_app_boot` repeats it into the log: `[env-file] applied: NAME=VALUE …` (or
+`(none)`) — so a Home View launch's log says what it ran with. Push it
+between launches:
+
+    xcrun devicectl device copy to --device <udid> --domain-type appDataContainer \
+      --domain-identifier <bundle id> --source klepton-env.txt \
+      --destination Documents/klepton-env.txt
 
 ## Wrapper-script control vars (`visionos/run.sh`, `build_run_vpro.sh`)
 

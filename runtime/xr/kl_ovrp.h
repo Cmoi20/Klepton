@@ -585,8 +585,8 @@ void kl_ovrp_set_display_frequency(float hz);
 void kl_ovrp_set_forced_hz_hint(float hz);
 
 // Battery telemetry, as one source of truth. The defaults are the Quest-2
-// fiction (95% / not charging) — on the host there is no battery. A visionOS
-// frontend that reads the real level off UIDevice pushes it through
+// fiction (95% / not charging) — on the host there is no battery. The visionOS
+// frontend reads the real level off UIDevice and pushes it through
 // kl_ovrp_set_battery_level, the same seam shape as
 // kl_ovrp_set_display_frequency, and BOTH the OVRPlugin query
 // (ovrp_GetSystemBatteryLevel2) and the Java BatteryManager answer
@@ -597,6 +597,18 @@ void kl_ovrp_set_battery_level(int level);     // 0..100, clamped
 int  kl_ovrp_battery_level(void);
 void kl_ovrp_set_battery_charging(int charging);
 int  kl_ovrp_battery_charging(void);
+// Per-hand controller batteries. `level == -1` means the platform/controller
+// did not provide a reading. `state` uses the small common vocabulary below so
+// the visionOS frontend does not leak a GameController enum into the runtime.
+enum {
+    KL_CONTROLLER_BATTERY_UNKNOWN = -1,
+    KL_CONTROLLER_BATTERY_DISCHARGING = 0,
+    KL_CONTROLLER_BATTERY_CHARGING = 1,
+    KL_CONTROLLER_BATTERY_FULL = 2,
+};
+void kl_ovrp_set_controller_battery(int hand, int level, int state);
+int  kl_ovrp_controller_battery_level(int hand);  // -1 or 0..100
+int  kl_ovrp_controller_battery_state(int hand);
 // ...and the third field of the same telemetry, in whole degrees Celsius. There
 // is no sensor here, so it is a nominal — but it is read through a getter for
 // the reason above: UE4's BatteryReceiver dispatches status, level and
@@ -682,6 +694,18 @@ int kl_ovrp_multiview(void);
 void kl_ovrp_eye_view(int eye, float *px, float *py, float *pz,
                       float *qx, float *qy, float *qz, float *qw,
                       float tangents[4]);
+
+// The frustum the guest is told for eye `eye` (0 = left, 1 = right): the same
+// tangents kl_ovrp_eye_view hands out, read without touching the pose latch.
+// out = left, right, top, bottom, all positive.
+void kl_ovrp_eye_tangents(int eye, float out[4]);
+
+// The frustum the guest's live eye layer DESCRIBES for eye `eye` (its
+// ovrpLayerDesc_EyeFov.Fov, l/r/t/b tangents, positive). Under symmetric
+// projection that is the union cone the eye was actually rendered with, which
+// is where its straight-ahead point sits in the (widened) eye image.
+// 0 when no eye layer carries one (OpenXR guests, before SetupLayer).
+int kl_ovrp_eye_layer_fov(int eye, float out[4]);
 
 // The head pose as the GUEST sees it — pinned for the duration of its frame by
 // kl_ovrp_frame_latch, and therefore NOT the same thing as

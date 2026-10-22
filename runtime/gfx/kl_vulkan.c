@@ -23,6 +23,7 @@
 #include "kl_vulkan.h"
 #include "kl_env.h"
 #include "kl_driver.h"   // kl_driver_target_name() — per-target GPU identity spoof
+#include "kl_fove.h"     // fixed foveation (the eye-pass recognition below)
 
 // Matched on with a prefix test rather than equality: the guest asks by plain
 // soname, but a path can arrive too (kl_dl.c hands through whatever the guest
@@ -97,6 +98,7 @@ unsigned long long kl_vulkan_xr_image(unsigned w, unsigned h, unsigned l,
     (void)w; (void)h; (void)l; (void)m; (void)f; (void)depth; return 0;
 }
 void *kl_vulkan_xr_image_mtl(unsigned long long img) { (void)img; return NULL; }
+int   kl_vulkan_fove_indirect_selftest(void) { return -1; }
 
 #else  /* MoltenVK headers present */
 
@@ -330,6 +332,24 @@ static void cache_display_luid(VkInstance inst); // GPU LUID snapshot for ovrp_G
 static VkPhysicalDevice klvk_sub_phys(const char *where); // live device for a NULL-handle guest
 // Substitute the live physical device wherever the guest passes NULL; see live_phys0.
 #define KLVK_PHYS_OR_SUB(pd, where) ((pd) ? (pd) : klvk_sub_phys(where))
+
+// Fixed foveation (kl_fove.m): the eye-pass recognition, defined with its
+// tables further down. Every one returns at once while foveation is off.
+static void fove_note_image(VkImage img, const VkImageCreateInfo *ci);
+static void fove_note_view(VkImageView v, const VkImageViewCreateInfo *ci);
+static void fove_note_fb(VkFramebuffer fb, const VkFramebufferCreateInfo *ci);
+static void fove_image_gone(VkImage img);
+static void fove_xr_image(VkImage img, uint32_t layers, uint32_t w, uint32_t h);
+static void fove_rp_note1(const VkRenderPassCreateInfo *ci, VkRenderPass rp);
+static void fove_rp_note2(const VkRenderPassCreateInfo2 *ci, VkRenderPass rp);
+static const VkRenderPassBeginInfo *fove_begin(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi,
+                                               VkRenderPassBeginInfo *tmp);
+static void fove_sec_begin(VkCommandBuffer cb);
+static void fove_xfer_note(const char *what, const char *via, VkImage src, VkImage dst, uint32_t n,
+                           const VkImageSubresourceLayers *ss, const VkImageSubresourceLayers *ds,
+                           int32_t sx, int32_t sy, int32_t dx, int32_t dy, uint32_t w, uint32_t h);
+static void fove_install(klvk_device *d);
+static PFN_vkVoidFunction fove_entry(const char *name);
 
 void kl_vulkan_stats(unsigned *p, unsigned *c) {
     if (p) *p = g_presented;
@@ -639,6 +659,7 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     pthread_mutex_lock(&g_lock);
     if (g_ndev < (int)(sizeof g_devs / sizeof *g_devs)) g_devs[g_ndev++] = d;
     pthread_mutex_unlock(&g_lock);
+    fove_install(d);   // KL_FOVEATION (default off: returns at once)
 
     VKI("vkCreateDevice ok — %u extension(s), queue family %u\n", keep.n, d->queue_family);
     return VK_SUCCESS;
@@ -2183,6 +2204,7 @@ unsigned long long kl_vulkan_xr_image(unsigned w, unsigned h, unsigned layers,
     VkImage img = klvk_image_alloc(d, (VkFormat)vk_format, w, h,
                                    layers ? layers : 1, mips ? mips : 1, usage, &mem);
     if (img == VK_NULL_HANDLE) return 0;
+    if (!depth) fove_xr_image(img, layers ? layers : 1, w, h);   // a runtime eye image (foveation)
     return (uint64_t)(uintptr_t)img;
 }
 
@@ -2640,6 +2662,10 @@ static void VKAPI_CALL klvk_CmdCopyImage(VkCommandBuffer cb, VkImage src,
             return;
         }
     }
+    if (n && regions)
+        fove_xfer_note("vkCmdCopyImage", "copy", src, dst, n, &regions->srcSubresource, &regions->dstSubresource,
+                       regions->srcOffset.x, regions->srcOffset.y, regions->dstOffset.x, regions->dstOffset.y,
+                       regions->extent.width, regions->extent.height);
     if (real) real(cb, src, sl, dst, dl, n, regions);
 }
 
@@ -2659,6 +2685,11 @@ static void VKAPI_CALL klvk_CmdBlitImage(VkCommandBuffer cb, VkImage src,
         src = klvk_sub_wild(src);
         dst = klvk_sub_wild(dst);
     }
+    if (n && r)
+        fove_xfer_note("vkCmdBlitImage", "blit", src, dst, n, &r->srcSubresource, &r->dstSubresource,
+                       r->srcOffsets[0].x, r->srcOffsets[0].y, r->dstOffsets[0].x, r->dstOffsets[0].y,
+                       (uint32_t)(r->dstOffsets[1].x - r->dstOffsets[0].x),
+                       (uint32_t)(r->dstOffsets[1].y - r->dstOffsets[0].y));
     if (real) real(cb, src, sl, dst, dl, n, r, f);
 }
 static void VKAPI_CALL klvk_CmdResolveImage(VkCommandBuffer cb, VkImage src,
@@ -2671,6 +2702,10 @@ static void VKAPI_CALL klvk_CmdResolveImage(VkCommandBuffer cb, VkImage src,
             (unsigned long long)(uintptr_t)src, (unsigned long long)(uintptr_t)dst);
         return;
     }
+    if (n && r)
+        fove_xfer_note("vkCmdResolveImage", "resolve", src, dst, n, &r->srcSubresource, &r->dstSubresource,
+                       r->srcOffset.x, r->srcOffset.y, r->dstOffset.x, r->dstOffset.y, r->extent.width,
+                       r->extent.height);
     if (real) real(cb, src, sl, dst, dl, n, r);
 }
 static void VKAPI_CALL klvk_CmdClearColorImage(VkCommandBuffer cb, VkImage img,
@@ -2926,6 +2961,7 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
         }
     }
     if (r == VK_SUCCESS && out) klvk_img_reg_add(*out);
+    if (r == VK_SUCCESS && out) fove_note_image(*out, ci);
     if (r == VK_SUCCESS && out && ci)
         klvk_img_info_add(*out, ci->format, ci->extent.width, ci->extent.height);
     if (r == VK_SUCCESS && out && *out && did_astc_sub) klvk_astc_sub_add(*out);
@@ -3021,6 +3057,7 @@ static void VKAPI_CALL klvk_DestroyImage(VkDevice dev, VkImage img,
     klvk_img_reg_del(img);
     klvk_img_info_del(img);
     klvk_shadow_forget(img);
+    fove_image_gone(img);
     if (real) real(dev, img, alloc);
 }
 
@@ -3089,6 +3126,7 @@ static VkResult VKAPI_CALL klvk_CreateImageView(VkDevice dev,
     }
     VkResult klvk_ivr = real(dev, ci, alloc, out);
     if (klvk_ivr==VK_SUCCESS && out && ci) klvk_view_map_add(*out, ci->image);
+    if (klvk_ivr==VK_SUCCESS && out && ci) fove_note_view(*out, ci);
     return klvk_ivr;
 }
 
@@ -3248,6 +3286,7 @@ static VkResult VKAPI_CALL klvk_CreateFramebuffer(VkDevice dev,
             g_fb_map[g_fb_map_n].att = ci->attachmentCount; g_fb_map_n++;
         }
         pthread_mutex_unlock(&g_fb_map_lock);
+        fove_note_fb(*out, ci);
         // KL_RT_DEBUG: remember the latest substantial UI render target (the guest
         // renders its menu pieces into these; the compositing that would gather
         // them into the submitted panel fails, so this is where the pixels are).
@@ -3349,6 +3388,8 @@ static void VKAPI_CALL klvk_CmdBeginRenderPass(VkCommandBuffer cb,
             (unsigned long long)(uintptr_t)im, klvk_img_tag(im), klvk_layer_image_key(im),
             bi->renderArea.extent.width, bi->renderArea.extent.height);
     }
+    VkRenderPassBeginInfo snap;
+    bi = fove_begin(cb, bi, &snap);   // KL_FOVEATION (off: returns bi)
     VkRenderPassBeginInfo tmp; VkClearValue *inj = klvk_probe_inject_clears(bi, &tmp);
     if (real) real(cb, inj ? &tmp : bi, c);
     free(inj);
@@ -3365,6 +3406,8 @@ static void VKAPI_CALL klvk_CmdBeginRenderPass2(VkCommandBuffer cb,
             (unsigned long long)(uintptr_t)im, klvk_img_tag(im), klvk_layer_image_key(im),
             bi->renderArea.extent.width, bi->renderArea.extent.height);
     }
+    VkRenderPassBeginInfo snap;
+    bi = fove_begin(cb, bi, &snap);   // KL_FOVEATION (off: returns bi)
     VkRenderPassBeginInfo tmp; VkClearValue *inj = klvk_probe_inject_clears(bi, &tmp);
     if (real) real(cb, inj ? &tmp : bi, sbi);
     free(inj);
@@ -3403,11 +3446,13 @@ static VkResult VKAPI_CALL klvk_CreateRenderPass(VkDevice dev,
                     k, d->pInputAttachments[k].attachment, (int)d->pInputAttachments[k].layout);
         }
     }
+    if (r == VK_SUCCESS && out) fove_rp_note1(ci, *out);   // foveation: the eye-pass check reads it
     return r;
 }
 static VkResult VKAPI_CALL klvk_CreateRenderPass2(VkDevice dev,
         const VkRenderPassCreateInfo2 *ci, const VkAllocationCallbacks *a,
         VkRenderPass *out) {
+    const VkRenderPassCreateInfo2 *guest_ci = ci;   // foveation reads the guest's own, not our copy
     static PFN_vkCreateRenderPass2 real;
     if (!real && real_gdpa) {
         real = (PFN_vkCreateRenderPass2)real_gdpa(dev, "vkCreateRenderPass2");
@@ -3498,6 +3543,7 @@ static VkResult VKAPI_CALL klvk_CreateRenderPass2(VkDevice dev,
                         d->pResolveAttachments[k].attachment);
         }
     }
+    if (r == VK_SUCCESS && out) fove_rp_note2(guest_ci, *out);
     free(atts);
     return r;
 }
@@ -4187,6 +4233,7 @@ static VkResult VKAPI_CALL klvk_BeginCommandBuffer(void *cb, const void *bi) {
     if (!real && real_gdpa) real = (VkResult (*)(void *, const void *))
         real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkBeginCommandBuffer");
     klvk_cb_set_idx(cb, 0);
+    fove_sec_begin((VkCommandBuffer)cb);   // a re-recorded secondary no longer carries its old indirect draw
     return real ? real(cb, bi) : VK_ERROR_INITIALIZATION_FAILED;
 }
 static void VKAPI_CALL klvk_CmdBindIndexBuffer(void *cb, uint64_t buffer,
@@ -5889,6 +5936,986 @@ static VkResult VKAPI_CALL klvk_CreateBufferView(VkDevice dev,
     return r;
 }
 
+// ---- fixed foveation (kl_fove.m, docs/FOVEATION.md) -----------------------
+//
+// kl_fove does the Metal side: it maps the encoders that draw a recognised eye
+// target, patches the guest's fragment shaders and expands the result. What it
+// cannot see from Metal is WHICH targets are eyes; that is plain here, in the
+// guest's Vulkan calls. A guest renders its eyes with vkCmdBeginRenderPass
+// into the images the runtime handed it (kl_ovrp's eye layer, or an OpenXR
+// swapchain from kl_vulkan_xr_image) — usually one 2-layer image, both eyes as
+// two slices (multiview). Three shapes are recognised at render-pass begin:
+//
+//   direct        the pass's colour attachment 0 IS a runtime eye image;
+//   MSAA + resolve an eye-size MSAA colour whose subpass-0 resolve attachment
+//                 is a runtime eye image;
+//   intermediate  the guest's OWN eye-size scene target that reaches an eye
+//                 later: written by a later subpass of the same pass, or
+//                 confirmed by a copy/blit/resolve into the eye, or by the
+//                 next pass that draws into the eye.
+//
+// Each needs a colour and a depth attachment of the same extent and sample
+// count. Their MTLTextures go to kl_fove (kl_fove_note_eye_array /
+// kl_fove_note_eye_scene). Every new pass shape, eye pass or near miss, is
+// logged once with its attachment table.
+//
+// Off (the default): kl_fove_on() is 0, none of the fove-only entry points is
+// handed out, and every note below returns at once — the tables stay empty.
+
+// One hash for every handle-keyed table here: handles are pointers (or
+// pointer-like), so the low bits alone cluster.
+static unsigned ptr_slot(uint64_t h, unsigned n) {
+    h ^= h >> 17; h *= 0x9e3779b97f4a7c15ull; h ^= h >> 29;
+    return (unsigned)(h % n);
+}
+
+// Open-addressed handle tables with tombstones: keys[] holds the handle, 0 =
+// never used, KLVK_FH_TOMB = freed. Returns the slot (made when `make`), or -1.
+#define KLVK_FH_TOMB 1ull
+static int fh_slot(uint64_t *keys, unsigned n, uint64_t k, int make) {
+    if (!k || k == KLVK_FH_TOMB) return -1;
+    unsigned i = ptr_slot(k, n);
+    int tomb = -1;
+    for (unsigned c = 0; c < n; c++, i = (i + 1) % n) {
+        if (keys[i] == k) return (int)i;
+        if (keys[i] == KLVK_FH_TOMB) { if (tomb < 0) tomb = (int)i; continue; }
+        if (!keys[i]) {
+            if (!make) return -1;
+            if (tomb >= 0) i = (unsigned)tomb;
+            keys[i] = k;
+            return (int)i;
+        }
+    }
+    if (make && tomb >= 0) { keys[tomb] = k; return tomb; }
+    return -1;
+}
+static void fh_drop(uint64_t *keys, unsigned n, uint64_t k) {
+    int i = fh_slot(keys, n, k, 0);
+    if (i >= 0) keys[i] = KLVK_FH_TOMB;
+}
+
+// The guest's images (vkCreateImage): extent, samples, layers, format — what
+// the eye-pass check compares. The runtime's own eye images are not here (they
+// are allocated by klvk_image_alloc); their extent comes from the eye tables.
+#define KLVK_GIMG_N 8192
+typedef struct { uint32_t w, h, samples, layers, fmt; } klvk_gimg;
+static uint64_t  g_gimg_key[KLVK_GIMG_N];
+static klvk_gimg g_gimg[KLVK_GIMG_N];
+static pthread_mutex_t g_gimg_lock = PTHREAD_MUTEX_INITIALIZER;
+static klvk_gimg *gimg_find_locked(VkImage img) {
+    int i = fh_slot(g_gimg_key, KLVK_GIMG_N, (uint64_t)(uintptr_t)img, 0);
+    return i < 0 ? NULL : &g_gimg[i];
+}
+static void fove_note_image(VkImage img, const VkImageCreateInfo *ci) {
+    if (!img || !ci || !kl_fove_on()) return;
+    pthread_mutex_lock(&g_gimg_lock);
+    int i = fh_slot(g_gimg_key, KLVK_GIMG_N, (uint64_t)(uintptr_t)img, 1);
+    if (i >= 0)
+        g_gimg[i] = (klvk_gimg){ ci->extent.width, ci->extent.height, (uint32_t)ci->samples,
+                                 ci->arrayLayers, (uint32_t)ci->format };
+    pthread_mutex_unlock(&g_gimg_lock);
+}
+
+// The guest's image views: which image, which array layers.
+#define KLVK_GVIEW_N 16384
+typedef struct { VkImage img; uint32_t base, count; } klvk_gview;
+static uint64_t   g_gview_key[KLVK_GVIEW_N];
+static klvk_gview g_gview[KLVK_GVIEW_N];
+static pthread_mutex_t g_gview_lock = PTHREAD_MUTEX_INITIALIZER;
+static void fove_note_view(VkImageView v, const VkImageViewCreateInfo *ci) {
+    if (!v || !ci || !kl_fove_on()) return;
+    pthread_mutex_lock(&g_gview_lock);
+    int i = fh_slot(g_gview_key, KLVK_GVIEW_N, (uint64_t)(uintptr_t)v, 1);
+    if (i >= 0) {
+        uint32_t n = ci->subresourceRange.layerCount;
+        g_gview[i] = (klvk_gview){ ci->image, ci->subresourceRange.baseArrayLayer,
+                                   n == VK_REMAINING_ARRAY_LAYERS ? 0 : n };   // 0 = to the end
+    }
+    pthread_mutex_unlock(&g_gview_lock);
+}
+static void fove_forget_view(VkImageView v) {
+    if (!v || !kl_fove_on()) return;
+    pthread_mutex_lock(&g_gview_lock);
+    fh_drop(g_gview_key, KLVK_GVIEW_N, (uint64_t)(uintptr_t)v);
+    pthread_mutex_unlock(&g_gview_lock);
+}
+// 0 known (and *img set), 1 unknown. NULL is "known" with no image.
+static int fove_view_state(VkImageView v, VkImage *img) {
+    if (img) *img = VK_NULL_HANDLE;
+    if (!v) return 0;
+    pthread_mutex_lock(&g_gview_lock);
+    int i = fh_slot(g_gview_key, KLVK_GVIEW_N, (uint64_t)(uintptr_t)v, 0);
+    if (i >= 0 && img) *img = g_gview[i].img;
+    pthread_mutex_unlock(&g_gview_lock);
+    return i < 0;
+}
+static void fove_view_range(VkImageView v, uint32_t *base, uint32_t *count) {
+    *base = 0; *count = 1;
+    pthread_mutex_lock(&g_gview_lock);
+    int i = fh_slot(g_gview_key, KLVK_GVIEW_N, (uint64_t)(uintptr_t)v, 0);
+    if (i >= 0) { *base = g_gview[i].base; *count = g_gview[i].count; }   // count 0 = to the end
+    pthread_mutex_unlock(&g_gview_lock);
+}
+
+// Framebuffers: the attachment views (none for an imageless framebuffer, whose
+// views arrive with the begin) and the extent MoltenVK compares the render
+// area with.
+#define KLVK_FFB_N 4096
+typedef struct { uint32_t nv; VkImageView v[16]; uint32_t w, h; } klvk_fbh;
+static uint64_t g_ffb_key[KLVK_FFB_N];
+static klvk_fbh g_ffb[KLVK_FFB_N];
+static pthread_mutex_t g_ffb_lock = PTHREAD_MUTEX_INITIALIZER;
+static klvk_fbh *ffb_get_locked(VkFramebuffer fb, int make) {
+    int i = fh_slot(g_ffb_key, KLVK_FFB_N, (uint64_t)(uintptr_t)fb, make);
+    return i < 0 ? NULL : &g_ffb[i];
+}
+static void fove_note_fb(VkFramebuffer fb, const VkFramebufferCreateInfo *ci) {
+    if (!fb || !ci || !kl_fove_on()) return;
+    int views = !(ci->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT) && ci->pAttachments;
+    pthread_mutex_lock(&g_ffb_lock);
+    klvk_fbh *f = ffb_get_locked(fb, 1);
+    if (f) {
+        f->nv = views ? (ci->attachmentCount < 16 ? ci->attachmentCount : 16) : 0;
+        if (f->nv) memcpy(f->v, ci->pAttachments, f->nv * sizeof *f->v);
+        f->w = ci->width; f->h = ci->height;
+    }
+    pthread_mutex_unlock(&g_ffb_lock);
+}
+static void fove_forget_fb(VkFramebuffer fb) {
+    if (!fb || !kl_fove_on()) return;
+    pthread_mutex_lock(&g_ffb_lock);
+    fh_drop(g_ffb_key, KLVK_FFB_N, (uint64_t)(uintptr_t)fb);
+    pthread_mutex_unlock(&g_ffb_lock);
+}
+
+// VkImage -> MTLTexture for the images handed to kl_fove (the export is not
+// free, and kl_fove keys its tables on the texture).
+#define KLVK_FOVE_N 32
+static struct { VkImage img; void *tex; } g_fove_img[KLVK_FOVE_N];
+static pthread_mutex_t g_fove_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void *fove_tex_locked(VkImage img) {
+    if (!img) return NULL;
+    for (int i = 0; i < KLVK_FOVE_N; i++) if (g_fove_img[i].img == img) return g_fove_img[i].tex;
+    void *t = eye_mtl_texture(g_devs[0], img);
+    if (!t) return NULL;
+    for (int i = 0; i < KLVK_FOVE_N; i++)
+        if (!g_fove_img[i].img) { g_fove_img[i].img = img; g_fove_img[i].tex = t; return t; }
+    g_fove_img[0].img = img; g_fove_img[0].tex = t;
+    return t;
+}
+
+// The OpenXR swapchain colour images this file created (kl_vulkan_xr_image).
+#define KLVK_XR_EYE_N 64
+static struct { VkImage img; uint32_t layers, w, h; } g_xr_col[KLVK_XR_EYE_N];
+static pthread_mutex_t g_xr_col_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_xr_col_n;            // live entries (destroy paths skip the lock at 0)
+static void fove_xr_image(VkImage img, uint32_t layers, uint32_t w, uint32_t h) {
+    if (!img || !kl_fove_on()) return;
+    int put = 0;
+    pthread_mutex_lock(&g_xr_col_lock);
+    for (int i = 0; i < KLVK_XR_EYE_N; i++)
+        if (!g_xr_col[i].img) {
+            g_xr_col[i].img = img; g_xr_col[i].layers = layers ? layers : 1; g_xr_col[i].w = w; g_xr_col[i].h = h;
+            __atomic_add_fetch(&g_xr_col_n, 1, __ATOMIC_RELAXED);
+            put = 1;
+            break;
+        }
+    pthread_mutex_unlock(&g_xr_col_lock);
+    static int said;
+    if (!put && !said++)
+        VKI("[fove] OpenXR swapchain image table full (%d colour images live): image %p %ux%u is NOT "
+            "recognised as an eye (drawn unfoveated)\n", KLVK_XR_EYE_N, (void *)img, w, h);
+}
+
+// An image going away (the guest's vkDestroyImage): every table drops it — a
+// guest that recreates its targets must not fill them, a VkImage handle reused
+// for an unrelated image must not be taken for an eye, and a confirmed
+// intermediate is sticky until here.
+static void fove_image_gone(VkImage img) {
+    if (!img || !kl_fove_on()) return;
+    void *t = NULL;
+    pthread_mutex_lock(&g_fove_lock);
+    for (int i = 0; i < KLVK_FOVE_N; i++)
+        if (g_fove_img[i].img == img) { t = g_fove_img[i].tex; g_fove_img[i].img = VK_NULL_HANDLE; g_fove_img[i].tex = NULL; }
+    pthread_mutex_unlock(&g_fove_lock);
+    if (t) kl_fove_forget(t);
+    kl_fove_inter_forget((uint64_t)(uintptr_t)img);
+    if (__atomic_load_n(&g_xr_col_n, __ATOMIC_RELAXED)) {
+        pthread_mutex_lock(&g_xr_col_lock);
+        for (int i = 0; i < KLVK_XR_EYE_N; i++)
+            if (g_xr_col[i].img == img) {
+                memset(&g_xr_col[i], 0, sizeof g_xr_col[i]);
+                __atomic_sub_fetch(&g_xr_col_n, 1, __ATOMIC_RELAXED);
+            }
+        pthread_mutex_unlock(&g_xr_col_lock);
+    }
+    pthread_mutex_lock(&g_gimg_lock);
+    fh_drop(g_gimg_key, KLVK_GIMG_N, (uint64_t)(uintptr_t)img);
+    pthread_mutex_unlock(&g_gimg_lock);
+}
+
+// Is img an eye image the runtime handed the guest? *layers = its array size,
+// *eye = 0/1 for a one-eye image (kl_ovrp Stereo layout), -1 for a pair or
+// when the owner does not say (an OpenXR swapchain: eye 0 is assumed).
+// *w/*h = its extent (0 when the owner does not record it).
+static int fove_runtime_eye_wh(VkImage img, uint32_t *layers, int *eye, uint32_t *w, uint32_t *h) {
+    if (!img) return 0;
+    for (int s = 0; s < KLVK_EYE_STAGES; s++)
+        for (int e = 0; e < 2; e++)
+            if (g_eye[s][e].img == img) {
+                *layers = g_eye[s][e].layers ? g_eye[s][e].layers : 1;
+                *eye = *layers >= 2 ? -1 : e;
+                if (w) *w = g_eye[s][e].w;
+                if (h) *h = g_eye[s][e].h;
+                return 1;
+            }
+    int hit = 0;
+    pthread_mutex_lock(&g_xr_col_lock);
+    for (int i = 0; i < KLVK_XR_EYE_N && !hit; i++)
+        if (g_xr_col[i].img == img) {
+            *layers = g_xr_col[i].layers; *eye = -1; hit = 1;
+            if (w) *w = g_xr_col[i].w;
+            if (h) *h = g_xr_col[i].h;
+        }
+    pthread_mutex_unlock(&g_xr_col_lock);
+    return hit;
+}
+static int fove_runtime_eye(VkImage img, uint32_t *layers, int *eye) {
+    return fove_runtime_eye_wh(img, layers, eye, NULL, NULL);
+}
+
+// Any kl_ovrp eye image of this extent? A target the size of a runtime eye
+// image — or a few px larger, as Unreal rounds its scene target up (a
+// 5088x3236 scene for a 5088x3234 eye, which an exact match left silently
+// unfoveated). The map is then sized to the INTERMEDIATE and the expand runs
+// on the intermediate itself, so the eye being the smaller of the two changes
+// nothing downstream.
+static int fove_eye_extent_known(uint32_t w, uint32_t h) {
+    for (int s = 0; s < KLVK_EYE_STAGES; s++)
+        for (int e = 0; e < 2; e++)
+            if (g_eye[s][e].img && kl_fove_inter_extent_ok(g_eye[s][e].w, g_eye[s][e].h, w, h)) return 1;
+    return 0;
+}
+
+// The guest's own eye-size scene target (an "intermediate"). The last
+// candidate's command buffer, for the "sampled" confirmation line.
+static VkCommandBuffer g_inter_last_cb;
+static int fove_probe_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_FOVE_PROBE", 0);
+    return on;
+}
+
+// The render passes' attachment structure, recorded at create time: which
+// attachment is the colour, depth and resolve of subpass 0, what the later
+// subpasses write, and the view masks.
+#define KLVK_FRP_N 2048
+typedef struct {
+    VkRenderPass rp;
+    uint8_t natt, nsub, ncol;
+    int8_t col0, dep, res0;
+    uint32_t viewmask;
+    // intermediates: attachments any subpass writes as colour or resolve (bit per
+    // attachment < 8; col0 excluded), and whether the subpasses' view masks differ
+    uint8_t outs, vm_mixed;
+    // transient MSAA intermediates: the attachment a LATER subpass (k >= 1)
+    // resolves col0 into (col0 as its colour c, pResolveAttachments[c] set), or
+    // -1. UE4's depth-read subpass: subpass 0 draws the MSAA scene, subpass 1
+    // LOADs it, reads depth as an input and resolves into the single-sample
+    // scene colour on its way out.
+    int8_t res_late;
+    struct { uint32_t fmt; uint8_t samples, load, store, sload; } a[8];
+} klvk_frp;
+static klvk_frp g_frp[KLVK_FRP_N];
+static pthread_mutex_t g_frp_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static klvk_frp *frp_get_locked(VkRenderPass rp, int make) {
+    unsigned i = ptr_slot((uint64_t)(uintptr_t)rp, KLVK_FRP_N);
+    for (unsigned n = 0; n < KLVK_FRP_N; n++, i = (i + 1) % KLVK_FRP_N) {
+        if (g_frp[i].rp == rp) return &g_frp[i];
+        if (!g_frp[i].rp) {
+            if (!make) return NULL;
+            memset(&g_frp[i], 0, sizeof g_frp[i]);
+            g_frp[i].rp = rp;
+            return &g_frp[i];
+        }
+    }
+    return NULL;
+}
+
+static int8_t frp_ref(uint32_t a) { return a < 8 ? (int8_t)a : (int8_t)-1; }   // VK_ATTACHMENT_UNUSED too
+
+static void fove_rp_note1(const VkRenderPassCreateInfo *ci, VkRenderPass rp) {
+    if (!ci || !rp || !kl_fove_on()) return;
+    pthread_mutex_lock(&g_frp_lock);
+    klvk_frp *r = frp_get_locked(rp, 1);
+    if (r) {
+        r->natt = (uint8_t)(ci->attachmentCount < 8 ? ci->attachmentCount : 8);
+        for (unsigned i = 0; i < r->natt && ci->pAttachments; i++) {
+            const VkAttachmentDescription *a = &ci->pAttachments[i];
+            r->a[i].fmt = (uint32_t)a->format; r->a[i].samples = (uint8_t)a->samples;
+            r->a[i].load = (uint8_t)a->loadOp; r->a[i].store = (uint8_t)a->storeOp;
+            r->a[i].sload = (uint8_t)a->stencilLoadOp;
+        }
+        r->nsub = (uint8_t)(ci->subpassCount < 255 ? ci->subpassCount : 255);
+        r->col0 = r->dep = r->res0 = -1; r->ncol = 0; r->viewmask = 0;
+        r->outs = r->vm_mixed = 0;
+        r->res_late = -1;
+        if (ci->subpassCount && ci->pSubpasses) {
+            const VkSubpassDescription *s = &ci->pSubpasses[0];
+            r->ncol = (uint8_t)s->colorAttachmentCount;
+            if (s->colorAttachmentCount && s->pColorAttachments) r->col0 = frp_ref(s->pColorAttachments[0].attachment);
+            if (s->colorAttachmentCount && s->pResolveAttachments) r->res0 = frp_ref(s->pResolveAttachments[0].attachment);
+            if (s->pDepthStencilAttachment) r->dep = frp_ref(s->pDepthStencilAttachment->attachment);
+            for (uint32_t k = 0; k < ci->subpassCount; k++) {
+                const VkSubpassDescription *t = &ci->pSubpasses[k];
+                for (uint32_t c = 0; c < t->colorAttachmentCount; c++) {
+                    int8_t a = t->pColorAttachments ? frp_ref(t->pColorAttachments[c].attachment) : -1;
+                    int8_t z = t->pResolveAttachments ? frp_ref(t->pResolveAttachments[c].attachment) : -1;
+                    if (a >= 0) r->outs |= (uint8_t)(1u << a);
+                    if (z >= 0) r->outs |= (uint8_t)(1u << z);
+                    if (k >= 1 && a >= 0 && a == r->col0 && z >= 0) r->res_late = z;
+                }
+            }
+            if (r->col0 >= 0) r->outs &= (uint8_t)~(1u << r->col0);
+        }
+        for (const VkBaseInStructure *b = (const VkBaseInStructure *)ci->pNext; b; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO) {
+                const VkRenderPassMultiviewCreateInfo *mv = (const VkRenderPassMultiviewCreateInfo *)b;
+                if (mv->subpassCount && mv->pViewMasks) r->viewmask = mv->pViewMasks[0];
+                for (uint32_t k = 1; mv->pViewMasks && k < mv->subpassCount; k++)
+                    if (mv->pViewMasks[k] != r->viewmask) r->vm_mixed = 1;
+            }
+    }
+    pthread_mutex_unlock(&g_frp_lock);
+}
+
+static void fove_rp_note2(const VkRenderPassCreateInfo2 *ci, VkRenderPass rp) {
+    if (!ci || !rp || !kl_fove_on()) return;
+    pthread_mutex_lock(&g_frp_lock);
+    klvk_frp *r = frp_get_locked(rp, 1);
+    if (r) {
+        r->natt = (uint8_t)(ci->attachmentCount < 8 ? ci->attachmentCount : 8);
+        for (unsigned i = 0; i < r->natt && ci->pAttachments; i++) {
+            const VkAttachmentDescription2 *a = &ci->pAttachments[i];
+            r->a[i].fmt = (uint32_t)a->format; r->a[i].samples = (uint8_t)a->samples;
+            r->a[i].load = (uint8_t)a->loadOp; r->a[i].store = (uint8_t)a->storeOp;
+            r->a[i].sload = (uint8_t)a->stencilLoadOp;
+        }
+        r->nsub = (uint8_t)(ci->subpassCount < 255 ? ci->subpassCount : 255);
+        r->col0 = r->dep = r->res0 = -1; r->ncol = 0; r->viewmask = 0;
+        r->outs = r->vm_mixed = 0;
+        r->res_late = -1;
+        if (ci->subpassCount && ci->pSubpasses) {
+            const VkSubpassDescription2 *s = &ci->pSubpasses[0];
+            r->ncol = (uint8_t)s->colorAttachmentCount;
+            if (s->colorAttachmentCount && s->pColorAttachments) r->col0 = frp_ref(s->pColorAttachments[0].attachment);
+            if (s->colorAttachmentCount && s->pResolveAttachments) r->res0 = frp_ref(s->pResolveAttachments[0].attachment);
+            if (s->pDepthStencilAttachment) r->dep = frp_ref(s->pDepthStencilAttachment->attachment);
+            r->viewmask = s->viewMask;
+            for (uint32_t k = 0; k < ci->subpassCount; k++) {
+                const VkSubpassDescription2 *t = &ci->pSubpasses[k];
+                for (uint32_t c = 0; c < t->colorAttachmentCount; c++) {
+                    int8_t a = t->pColorAttachments ? frp_ref(t->pColorAttachments[c].attachment) : -1;
+                    int8_t z = t->pResolveAttachments ? frp_ref(t->pResolveAttachments[c].attachment) : -1;
+                    if (a >= 0) r->outs |= (uint8_t)(1u << a);
+                    if (z >= 0) r->outs |= (uint8_t)(1u << z);
+                    if (k >= 1 && a >= 0 && a == r->col0 && z >= 0) r->res_late = z;
+                }
+                if (t->viewMask != r->viewmask) r->vm_mixed = 1;
+            }
+            if (r->col0 >= 0) r->outs &= (uint8_t)~(1u << r->col0);
+        }
+    }
+    pthread_mutex_unlock(&g_frp_lock);
+}
+
+// Where an eye-size intermediate reaches the runtime's eye image (transfer
+// census, fove only): the first transfer of each kind into one is named once,
+// with its first region's shape (KL_FOVE_PROBE=1: the first 4 of each kind).
+// A transfer from a CANDIDATE intermediate confirms it.
+static void fove_xfer_note(const char *what, const char *via, VkImage src, VkImage dst, uint32_t n,
+                           const VkImageSubresourceLayers *ss, const VkImageSubresourceLayers *ds,
+                           int32_t sx, int32_t sy, int32_t dx, int32_t dy, uint32_t w, uint32_t h) {
+    uint32_t el = 0; int ee = -1;
+    if (!kl_fove_on() || !fove_runtime_eye(dst, &el, &ee)) return;
+    if (kl_fove_intermediate() && kl_fove_inter_confirm((uint64_t)(uintptr_t)src, KL_FOVE_VIA_XFER) == 1)
+        VKI("[fove] intermediate CONFIRMED: VkImage %p -> eye image %p via %s (%s)\n", (void *)src, (void *)dst, via, what);
+    static struct { const char *what; int n; } said[8]; static unsigned nsaid;
+    static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    int k = -1, show = 0;
+    pthread_mutex_lock(&lk);
+    for (unsigned i = 0; i < nsaid; i++) if (said[i].what == what) k = (int)i;
+    if (k < 0 && nsaid < 8) { k = (int)nsaid++; said[k].what = what; said[k].n = 0; }
+    if (k >= 0 && said[k].n < (fove_probe_on() ? 4 : 1)) { said[k].n++; show = 1; }
+    pthread_mutex_unlock(&lk);
+    if (!show) return;
+    uint32_t sw = 0, sh = 0, sm = 0, sl = 0;
+    pthread_mutex_lock(&g_gimg_lock);
+    klvk_gimg *g = gimg_find_locked(src);
+    if (g) { sw = g->w; sh = g->h; sm = g->samples; sl = g->layers; }
+    pthread_mutex_unlock(&g_gimg_lock);
+    int ist = kl_fove_inter_state((uint64_t)(uintptr_t)src, NULL);
+    VKI("[fove] %s INTO a runtime eye image %p (%u layer(s)) from %p %ux%u x%u (%u layer(s)), %u region(s) — "
+        "the eye content is drawn elsewhere and transferred | region 0: src layers %u+%u at %d,%d -> dst layers "
+        "%u+%u at %d,%d, %ux%u; source is %s\n", what, (void *)dst, el, (void *)src, sw, sh, sm, sl, n,
+        ss ? ss->baseArrayLayer : 0, ss ? ss->layerCount : 0, sx, sy, ds ? ds->baseArrayLayer : 0,
+        ds ? ds->layerCount : 0, dx, dy, w, h,
+        ist == 2 ? "a CONFIRMED intermediate" : ist == 1 ? "a candidate intermediate"
+        : "not a recorded eye-size pass target");
+}
+// What the render pass last begun on a
+// command buffer is to kl_fove, for the indirect-draw hooks. MoltenVK splits a
+// multiview pass around every indirect draw (a compute encoder adjusts the
+// instance count, then the pass resumes with LOAD); kl_fove's compute hook
+// flushes the expand there, so the resumed half draws in screen layout over a
+// depth left in physical layout. Paint the Town Red's first DrawIndirect is
+// its "Combat Started" (every attempt) — the bar went black outside
+// ~30% of the view (the skybox filling the far-cleared depth), or see-through.
+// kind: 0 nothing foveated, 1 candidate intermediate, 2 confirmed intermediate,
+// 3 a pass into a runtime eye image (counted only). Direct-mapped by cb.
+#define KLVK_FCB_N 256
+static struct { VkCommandBuffer cb; VkImage img; void *tex; int kind, mv; } g_fcb[KLVK_FCB_N];
+static pthread_mutex_t g_fcb_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_fcb_eye_indirect;
+static void fcb_set(VkCommandBuffer cb, VkImage img, void *tex, int kind, int mv) {
+    unsigned h = (unsigned)(((uintptr_t)cb >> 4) % KLVK_FCB_N);
+    pthread_mutex_lock(&g_fcb_lock);
+    if (kind || g_fcb[h].cb == cb) {
+        g_fcb[h].cb = cb; g_fcb[h].img = img; g_fcb[h].tex = tex; g_fcb[h].kind = kind; g_fcb[h].mv = mv;
+    }
+    pthread_mutex_unlock(&g_fcb_lock);
+}
+// Secondaries: a run with only the lookup above showed 340 SPLIT PASS encoders
+// and ZERO refusals — Unity records its scene draws into SECONDARY command
+// buffers (vkCmdExecuteCommands ~7 a frame), so the indirect draw arrives on a
+// command buffer that never began a render pass and the lookup found nothing.
+// A command buffer with no pass of its own that records an indirect draw is
+// remembered here (direct-mapped, cleared when it is begun again); the
+// vkCmdExecuteCommands that plays it inside a foveated multiview pass refuses
+// that pass's intermediate exactly as an inline indirect draw would.
+#define KLVK_FSEC_N 1024
+static struct { VkCommandBuffer cb; const char *what; } g_fsec[KLVK_FSEC_N];
+static uint32_t g_fsec_seen;
+static void fove_sec_begin(VkCommandBuffer cb) {
+    if (!__atomic_load_n(&g_fsec_seen, __ATOMIC_RELAXED)) return;
+    unsigned h = (unsigned)(((uintptr_t)cb >> 4) % KLVK_FSEC_N);
+    pthread_mutex_lock(&g_fcb_lock);
+    if (g_fsec[h].cb == cb) { g_fsec[h].cb = VK_NULL_HANDLE; g_fsec[h].what = NULL; }
+    pthread_mutex_unlock(&g_fcb_lock);
+}
+static void fove_refuse_in(VkCommandBuffer cb, VkImage img, void *tex, int kind, int mv, const char *what,
+                           const char *where) {
+    if (kind == 3) {
+        uint32_t n = __atomic_add_fetch(&g_fcb_eye_indirect, 1, __ATOMIC_RELAXED);
+        if (n <= 2)
+            VKI("[fove] %s inside a multiview pass into a runtime EYE image%s (#%u): MoltenVK splits that pass; if a "
+                "`SPLIT PASS` line follows, that eye pass draws its second half over physical-layout depth\n", what,
+                where, n);
+        return;
+    }
+    if (!kl_fove_intermediate()) return;
+    int was = kl_fove_inter_refuse((uint64_t)(uintptr_t)img);
+    if (was == 3) return;
+    if (tex) kl_fove_demote(tex);
+    fcb_set(cb, img, tex, 0, mv);
+    VKI("[fove] intermediate REFUSED: VkImage %p (was %s) — %s inside its multiview pass%s; MoltenVK splits that pass "
+        "around a compute encoder and resumes it with LOAD, and the second half would draw over a depth still in "
+        "physical layout. Left UNFOVEATED until it is destroyed\n", (void *)img,
+        was == 2 ? "CONFIRMED" : was == 1 ? "a candidate" : "unseen", what, where);
+}
+static void fove_exec(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer *sec) {
+    if (!sec || !n || !kl_fove_on()) return;
+    unsigned h = (unsigned)(((uintptr_t)cb >> 4) % KLVK_FCB_N);
+    VkImage img = VK_NULL_HANDLE; void *tex = NULL; int kind = 0, mv = 0;
+    const char *what = NULL;
+    pthread_mutex_lock(&g_fcb_lock);
+    if (g_fcb[h].cb == cb) { img = g_fcb[h].img; tex = g_fcb[h].tex; kind = g_fcb[h].kind; mv = g_fcb[h].mv; }
+    if (kind && mv)
+        for (uint32_t i = 0; i < n && !what; i++) {
+            unsigned k = (unsigned)(((uintptr_t)sec[i] >> 4) % KLVK_FSEC_N);
+            if (sec[i] && g_fsec[k].cb == sec[i]) what = g_fsec[k].what;
+        }
+    pthread_mutex_unlock(&g_fcb_lock);
+    if (what) fove_refuse_in(cb, img, tex, kind, mv, what, " (recorded in a SECONDARY command buffer, G10b)");
+}
+static void fove_indirect(VkCommandBuffer cb, const char *what) {
+    if (!kl_fove_on()) return;
+    unsigned h = (unsigned)(((uintptr_t)cb >> 4) % KLVK_FCB_N);
+    VkImage img = VK_NULL_HANDLE; void *tex = NULL; int kind = 0, mv = 0, own = 0;
+    pthread_mutex_lock(&g_fcb_lock);
+    if (g_fcb[h].cb == cb) { own = 1; img = g_fcb[h].img; tex = g_fcb[h].tex; kind = g_fcb[h].kind; mv = g_fcb[h].mv; }
+    else {
+        // No pass begun on this command buffer — a secondary (or a slot
+        // collision, which only costs foveation). Remembered for its execute.
+        unsigned k = (unsigned)(((uintptr_t)cb >> 4) % KLVK_FSEC_N);
+        if (g_fsec[k].cb != cb) { g_fsec[k].cb = cb; g_fsec[k].what = what; }
+    }
+    pthread_mutex_unlock(&g_fcb_lock);
+    if (!own) {
+        uint32_t c = __atomic_add_fetch(&g_fsec_seen, 1, __ATOMIC_RELAXED);
+        if (c == 1)
+            VKI("[fove] %s on a command buffer with no render pass of its own (a SECONDARY): remembered; the "
+                "vkCmdExecuteCommands that plays it inside a foveated multiview pass refuses that pass (G10b)\n", what);
+        return;
+    }
+    if (!kind || !mv) return;
+    fove_refuse_in(cb, img, tex, kind, mv, what, "");
+}
+
+// t_fove: Paint the Town Red's shape with fake handles — a confirmed
+// intermediate's multiview pass begun on a PRIMARY, the indirect draw recorded
+// on a SECONDARY, then the primary executes it. Needs KL_FOVEATION on. Returns
+// failed checks, -1 when foveation is off.
+int kl_vulkan_fove_indirect_selftest(void) {
+    if (!kl_fove_intermediate()) return -1;
+    int bad = 0;
+    VkCommandBuffer P = (VkCommandBuffer)(uintptr_t)0x5a0000100, S = (VkCommandBuffer)(uintptr_t)0x5a0000a40,
+                    S2 = (VkCommandBuffer)(uintptr_t)0x5a0000c80;
+    const uint64_t A = 0x5b0001000, LD = 0x5b0002000;
+    kl_fove_inter_reset_for_test();
+    kl_fove_inter_note(A, NULL); kl_fove_inter_note(LD, NULL);
+    if (kl_fove_inter_eye_reached(1, NULL, 0) != 2) bad++;
+    // 1. a secondary WITHOUT an indirect draw played in A's pass: nothing.
+    fove_sec_begin(S2);
+    fcb_set(P, (VkImage)(uintptr_t)A, NULL, 2, 1);
+    fove_exec(P, 1, &S2);
+    if (kl_fove_inter_state(A, NULL) != 2) bad++;
+    // 2. the secondary carries the indirect draw: remembered, then refused at execute.
+    fove_sec_begin(S);
+    fove_indirect(S, "vkCmdDrawIndirect");
+    if (kl_fove_inter_state(A, NULL) != 2) bad++;           // nothing known at record time
+    fove_exec(P, 1, &S);
+    if (kl_fove_inter_state(A, NULL) != 3) bad++;
+    // 3. the LDR pass on the same primary, the same secondary RE-RECORDED without one: LDR stays.
+    fove_sec_begin(S);
+    fcb_set(P, (VkImage)(uintptr_t)LD, NULL, 2, 1);
+    fove_exec(P, 1, &S);
+    if (kl_fove_inter_state(LD, NULL) != 2) bad++;
+    // 4. a non-multiview pass executing an indirect secondary: not refused.
+    fove_indirect(S, "vkCmdDrawIndirect");
+    fcb_set(P, (VkImage)(uintptr_t)LD, NULL, 2, 0);
+    fove_exec(P, 1, &S);
+    if (kl_fove_inter_state(LD, NULL) != 2) bad++;
+    fcb_set(P, VK_NULL_HANDLE, NULL, 0, 0);
+    fove_sec_begin(S);
+    kl_fove_inter_reset_for_test();
+    return bad;
+}
+
+static int fove_rp(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi) {
+    if (!bi || !kl_fove_on()) return 0;
+    fcb_set(cb, VK_NULL_HANDLE, NULL, 0, 0);
+    klvk_frp r;
+    pthread_mutex_lock(&g_frp_lock);
+    klvk_frp *rr = frp_get_locked(bi->renderPass, 0);
+    if (rr) r = *rr;
+    pthread_mutex_unlock(&g_frp_lock);
+    if (!rr || r.col0 < 0) return 0;
+    VkImageView v[16]; uint32_t nv = 0;
+    for (const VkBaseInStructure *b = (const VkBaseInStructure *)bi->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO) {
+            const VkRenderPassAttachmentBeginInfo *ab = (const VkRenderPassAttachmentBeginInfo *)b;
+            nv = ab->attachmentCount < 16 ? ab->attachmentCount : 16;
+            if (ab->pAttachments) memcpy(v, ab->pAttachments, nv * sizeof *v); else nv = 0;
+        }
+    if (!nv) {
+        pthread_mutex_lock(&g_ffb_lock);
+        klvk_fbh *f = ffb_get_locked(bi->framebuffer, 0);
+        if (f) { nv = f->nv; memcpy(v, f->v, nv * sizeof *v); }
+        pthread_mutex_unlock(&g_ffb_lock);
+    }
+    if ((uint32_t)r.col0 >= nv) return 0;
+    VkImage ci = VK_NULL_HANDLE, di = VK_NULL_HANDLE, ri = VK_NULL_HANDLE;
+    if (fove_view_state(v[r.col0], &ci) || !ci) return 0;
+    if (r.dep >= 0 && (uint32_t)r.dep < nv && fove_view_state(v[r.dep], &di)) di = VK_NULL_HANDLE;
+    if (r.res0 >= 0 && (uint32_t)r.res0 < nv && fove_view_state(v[r.res0], &ri)) ri = VK_NULL_HANDLE;
+    uint32_t cw = 0, ch = 0, cs = 0, cl = 0, dw = 0, dh = 0, ds = 0, rw = 0, rh = 0;
+    pthread_mutex_lock(&g_gimg_lock);
+    klvk_gimg *g = gimg_find_locked(ci);
+    if (g) { cw = g->w; ch = g->h; cs = g->samples; cl = g->layers; }
+    if ((g = gimg_find_locked(di))) { dw = g->w; dh = g->h; ds = g->samples; }
+    if ((g = gimg_find_locked(ri))) { rw = g->w; rh = g->h; }
+    pthread_mutex_unlock(&g_gimg_lock);
+    uint32_t el = 0, ew = 0, eh = 0; int ee = -1;
+    int direct = fove_runtime_eye_wh(ci, &el, &ee, &ew, &eh);
+    if (direct && !cw) { cw = ew; ch = eh; cs = 1; cl = el; }
+    // An eye image attached at ANOTHER extent than the colour (resolve, or a
+    // later subpass's output): named on the near-miss line instead of silence.
+    // Resident Evil 4 (UE4 4.25) quantized its scene to 4032x3236 over a
+    // 4032x3234 eye and nothing was printed at all.
+    uint32_t mis_w = 0, mis_h = 0;
+    int via_res = 0;
+    if (!direct && ri && fove_runtime_eye_wh(ri, &el, &ee, &rw, &rh)) {
+        if (rw == cw && rh == ch) via_res = 1;
+        else { mis_w = rw; mis_h = rh; }
+    }
+    uint32_t vb = 0, vc = 1;
+    fove_view_range(v[r.col0], &vb, &vc);
+    uint32_t L = r.viewmask ? (uint32_t)__builtin_popcount(r.viewmask) : (vc ? vc : (cl > vb ? cl - vb : 1));
+    // The colour is the guest's OWN eye-size target. (a) In-pass: a
+    // later subpass of this render pass writes (or resolves into) a runtime eye
+    // image — Batman: Arkham Shadow: 2-sample scene + depth, the post subpass reads
+    // the scene as an input attachment and writes the eye. (b) A candidate the
+    // guest copies/blits/samples into the eye later: confirmed by that
+    // transfer or pass (the confirming frame stays unfoveated), sticky until
+    // vkDestroyImage, then marked like an eye on every later frame.
+    VkImage oi = VK_NULL_HANDLE; int oj = -1;          // (a): the eye image and its attachment index
+    int conf = 0, conf_via = 0, cand = 0, refused = 0; // (b); refused: an indirect draw in the pass
+    int inter_on = !direct && !via_res && kl_fove_intermediate() && cw && ch && r.dep >= 0;
+    if (inter_on) {
+        for (unsigned j = 0; j < r.natt && j < nv && !oi; j++) {
+            if (!(r.outs >> j & 1)) continue;
+            VkImage im = VK_NULL_HANDLE; uint32_t ol = 0, ow = 0, oh = 0; int oe = -1;
+            if (fove_view_state(v[j], &im) || !im) continue;
+            if (fove_runtime_eye_wh(im, &ol, &oe, &ow, &oh)) {
+                if (!ow || (ow == cw && oh == ch)) { oi = im; oj = (int)j; el = ol; ee = oe; }
+                else if (!mis_w) { mis_w = ow; mis_h = oh; }
+            }
+        }
+        if (!oi && fove_eye_extent_known(cw, ch)) {
+            int st = kl_fove_inter_note((uint64_t)(uintptr_t)ci, &conf_via);
+            if (st == 2) { conf = 1; el = cl; ee = -1; }
+            else if (st == 3) refused = 1;
+            else { cand = 1; g_inter_last_cb = cb; }
+        }
+    }
+    // Why this pass is (not) an eye pass, for the once-per-shape line.
+    const char *why = NULL;
+    static __thread char mis_why[256];
+    if (!direct && !via_res && !oi && !conf && mis_w) {
+        snprintf(mis_why, sizeof mis_why, "a runtime eye image (%ux%u) is attached as the resolve or a later "
+                 "subpass's output at ANOTHER extent than the colour (%ux%u) — the guest quantized its scene buffer "
+                 "(an eye size that is a multiple of 4 matches an Unreal guest)", mis_w, mis_h, cw, ch);
+        why = mis_why;
+    } else if (refused)
+        why = "eye-size intermediate REFUSED (an indirect draw inside its multiview pass: MoltenVK splits the pass) — "
+              "left unfoveated";
+    else if (!direct && !via_res && !oi && !conf)
+        why = r.dep >= 0 && fove_eye_extent_known(cw, ch)
+            ? (cand ? "eye-size pass that does not draw into (or resolve into) a runtime eye image — CANDIDATE "
+                      "intermediate: marked from the next frame on once a copy/blit/resolve into the eye, or a pass "
+                      "drawing into the eye after it, confirms it"
+                    : "eye-size pass that does not draw into (or resolve into) a runtime eye image — an intermediate "
+                      "the guest copies/blits later is not foveated by this path (KL_FOVE_INTERMEDIATE=0)")
+            : NULL;
+    else if (!di) why = "no depth attachment (a post/blit pass, not the scene)";
+    else if (dw != cw || dh != ch) why = "depth extent differs from colour";
+    else if (cs != ds) why = "colour and depth sample counts differ";
+    else if (cs > 1 && !kl_fove_msaa()) why = "MSAA and KL_FOVE_MSAA=0";
+    else if (L >= 2 && (r.viewmask ? (r.viewmask & 3u) != 3u || L != 2 : vb != 0 || L != 2))
+        why = "a multiview pass over other than views/slices 0 and 1";
+    else if (L >= 2 && el < 2) why = "multiview pass over a one-layer image";
+    else if (oi && r.a[r.col0].store != (uint8_t)VK_ATTACHMENT_STORE_OP_DONT_CARE)
+        why = "in-pass intermediate whose scene colour is STORED (it outlives the pass in physical layout)";
+    else if (oi && (uint32_t)oj < r.natt && r.a[oj].load == (uint8_t)VK_ATTACHMENT_LOAD_OP_LOAD)
+        why = "in-pass intermediate whose eye attachment is LOADed";
+    else if (oi && r.vm_mixed) why = "in-pass intermediate whose subpasses have different view masks";
+    int eye_pass = (direct || via_res || oi || conf) && !why;
+    if (eye_pass) {
+        pthread_mutex_lock(&g_fove_lock);
+        void *ct = fove_tex_locked(ci), *dt = fove_tex_locked(di), *ot = oi ? fove_tex_locked(oi) : NULL;
+        pthread_mutex_unlock(&g_fove_lock);
+        int lay = L >= 2 ? 2 : 1, one = L >= 2 ? -1 : (ee == 1 ? 1 : 0);
+        if (!ct || (oi && !ot)) why = "no MTLTexture behind the colour (or eye) image", eye_pass = 0;
+        else if (oi) {
+            kl_fove_note_eye_scene(ct, dt, ot, cw, ch, cs, (uint32_t)lay, one, KL_FOVE_VIA_SUBPASS);
+            kl_fove_inter_note((uint64_t)(uintptr_t)ci, NULL);
+            if (kl_fove_inter_confirm((uint64_t)(uintptr_t)ci, KL_FOVE_VIA_SUBPASS) == 1)
+                VKI("[fove] intermediate CONFIRMED: VkImage %p -> eye image %p via subpass (attachment #%d of render "
+                    "pass %p, written by a later subpass; %u subpass(es), scene %ux%u x%u)\n", (void *)ci, (void *)oi,
+                    oj, (void *)bi->renderPass, r.nsub, cw, ch, cs);
+        } else if (conf) {
+            kl_fove_note_eye_scene(ct, dt, NULL, cw, ch, cs, (uint32_t)lay, one, conf_via);
+            // Transient MSAA (Deadpool's UE4 shape): an MSAA scene the guest does NOT store
+            // (storeOp DONT_CARE) and a later subpass of this pass resolves into
+            // a single-sample attachment. Its samples die with the pass, so kl_fove
+            // may leave them in physical layout across the subpass encoders and
+            // expand only what the resolve writes (no per-sample expand).
+            int tr = cs > 1 && r.a[r.col0].store == (uint8_t)VK_ATTACHMENT_STORE_OP_DONT_CARE && r.res_late >= 0 &&
+                     r.res_late < (int8_t)r.natt && r.a[r.res_late].samples == 1;
+            kl_fove_note_ms_transient(ct, tr);
+            static int said_tr;
+            if (tr && !said_tr++)
+                VKI("[fove] intermediate %p: MSAA x%u scene with storeOp DONT_CARE, resolved by a later subpass into "
+                    "attachment #%d (x1): its samples stay in physical layout through the pass, the resolve target "
+                    "is what gets expanded\n", (void *)ci, cs, r.res_late);
+        } else kl_fove_note_eye_array(ct, dt, cw, ch, cs, (uint32_t)lay, one);
+    }
+    // What this pass is, for an indirect draw recorded inside it.
+    {
+        int mv = r.viewmask != 0;
+        if (conf && eye_pass) {
+            pthread_mutex_lock(&g_fove_lock);
+            void *ct = fove_tex_locked(ci);
+            pthread_mutex_unlock(&g_fove_lock);
+            fcb_set(cb, ci, ct, 2, mv);
+        } else if (cand) fcb_set(cb, ci, NULL, 1, mv);
+        else if (eye_pass && (direct || via_res || oi)) fcb_set(cb, ci, NULL, 3, mv);
+    }
+    // A pass drawing into an eye image: it may be the one that samples the
+    // candidate intermediate(s) into the eye, with OR without a depth
+    // attachment — Unity's HDR path draws its scene into a 1x R16G16B16A16
+    // eye-size target, then its final pass into the eye binds the scene depth
+    // (DONT_CARE); a rule that wanted `!di` here never confirmed anything and
+    // such a level ran unfoveated (Paint the Town Red: `exp 0 marked 0`, guest
+    // GPU p99 24.7 ms). Every candidate noted since the
+    // previous pass into an eye is confirmed (a post chain HDR -> LDR -> eye
+    // confirms each hop). An MSAA pass RESOLVING into the eye, or an in-pass
+    // intermediate, only closes that window.
+    if (kl_fove_intermediate() && (direct || via_res || oi)) {
+        uint64_t last = kl_fove_inter_last();
+        static int probed;
+        if (direct && fove_probe_on() && probed < 4) {
+            probed++;
+            VKI("[fove] probe: pass into eye image %p with%s depth (render pass %p, %u subpass(es), area %ux%u); last "
+                "candidate intermediate %p (same command buffer: %s)\n", (void *)ci, di ? "" : " no",
+                (void *)bi->renderPass, r.nsub, bi->renderArea.extent.width, bi->renderArea.extent.height,
+                (void *)(uintptr_t)last, last && g_inter_last_cb == cb ? "yes" : "no");
+        }
+        uint64_t got[8];
+        int ng = kl_fove_inter_eye_reached(direct, got, 8);
+        for (int k = 0; k < ng && k < 8; k++)
+            VKI("[fove] intermediate CONFIRMED: VkImage %p -> eye image %p via sampled (a later pass draws into the "
+                "eye, %s depth, render pass %p; %d candidate(s) in this window; the last one's command buffer is "
+                "this one: %s)\n", (void *)(uintptr_t)got[k], (void *)ci, di ? "with" : "no",
+                (void *)bi->renderPass, ng, g_inter_last_cb == cb ? "yes" : "no");
+    }
+    if (!eye_pass && !why) return 0;   // an unrelated pass: silent
+    // One line per new shape (render pass + which images).
+    static struct { VkRenderPass rp; int eye; } seen[64];
+    static unsigned nseen;
+    static pthread_mutex_t seen_lock = PTHREAD_MUTEX_INITIALIZER;
+    int fresh = 1;
+    pthread_mutex_lock(&seen_lock);
+    for (unsigned i = 0; i < nseen; i++) if (seen[i].rp == bi->renderPass && seen[i].eye == eye_pass) fresh = 0;
+    if (fresh && nseen < 64) { seen[nseen].rp = bi->renderPass; seen[nseen].eye = eye_pass; nseen++; }
+    else if (fresh) fresh = 0;
+    pthread_mutex_unlock(&seen_lock);
+    if (!fresh) return eye_pass;
+    char att[512]; int o = 0;
+    for (unsigned i = 0; i < r.natt && o < (int)sizeof att - 64; i++)
+        o += snprintf(att + o, sizeof att - (size_t)o, "%s#%u fmt %u x%u load %u store %u%s", i ? "; " : "", i,
+                      r.a[i].fmt, r.a[i].samples, r.a[i].load, r.a[i].store,
+                      (int)i == r.col0 ? " =colour" : (int)i == r.dep ? " =depth" : (int)i == r.res0 ? " =resolve" : "");
+    if (!eye_pass) {
+        char eyes[256]; int eo = 0;
+        for (int s2 = 0; s2 < KLVK_EYE_STAGES && eo < (int)sizeof eyes - 40; s2++)
+            for (int e2 = 0; e2 < 2; e2++)
+                if (g_eye[s2][e2].img) eo += snprintf(eyes + eo, sizeof eyes - (size_t)eo, " s%d/e%d=%p", s2, e2, (void *)g_eye[s2][e2].img);
+        VKI("[fove] near miss images: colour %p depth %p resolve %p (resolve %ux%u); runtime eye images:%s\n",
+            (void *)ci, (void *)di, (void *)ri, rw, rh, eo ? eyes : " none");
+    }
+    VKI("[fove] %s render pass %p: %s %ux%u x%u (%u layer(s), view base %u count %u, viewMask 0x%x)%s, depth %ux%u x%u, "
+        "%u subpass(es), %u colour attachment(s), area %d,%d %ux%u | %s%s%s\n",
+        eye_pass ? "EYE PASS (marked)" : "near miss, NOT marked:", (void *)bi->renderPass,
+        direct ? "colour = runtime eye image" : via_res ? "MSAA colour resolved into a runtime eye image"
+        : oi ? "eye-size intermediate, a later subpass writes a runtime eye image"
+        : conf ? "confirmed eye-size intermediate (the guest transfers/samples it into the eye)" : "colour",
+        cw, ch, cs, cl, vb, vc, r.viewmask, via_res ? "" : "", dw, dh, ds, r.nsub, r.ncol,
+        bi->renderArea.offset.x, bi->renderArea.offset.y, bi->renderArea.extent.width, bi->renderArea.extent.height,
+        att, why ? " | why: " : "", why ? why : "");
+    return eye_pass;
+}
+
+// KL_FOVE_AREA_SNAP (default 1, foveation only): an EYE PASS whose render
+// area falls a few px short of its framebuffer is widened to the whole
+// framebuffer. MoltenVK honours loadOp CLEAR as a Metal clear only when the
+// render area IS the framebuffer extent; otherwise every attachment opens with
+// MTLLoadActionLoad and the clear is drawn as a quad — and kl_fove can never
+// map a pass that LOADs an eye with nothing foveated pending (it would read
+// screen-layout pixels as physical). Pinball FX (UE 5.3.2) without this:
+// area 4608x2935 on a 4608x2936 eye (Unreal quantizes its scene
+// buffer UP to a multiple of 4 and renders the unquantized height), so every
+// eye pass LOADed and the whole run was foveated 0% ("eye LOADs left
+// unfoveated" 1970, encoders marked 0). The extra rows/columns lie outside
+// every viewport the guest submits; they are only cleared and stored.
+// Returns bi itself, or `tmp` holding the widened copy.
+static const VkRenderPassBeginInfo *fove_area_snap(const VkRenderPassBeginInfo *bi, VkRenderPassBeginInfo *tmp) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_FOVE_AREA_SNAP", 1);
+    if (!on || !bi || bi->renderArea.offset.x || bi->renderArea.offset.y) return bi;
+    uint32_t fw = 0, fh = 0;
+    pthread_mutex_lock(&g_ffb_lock);
+    klvk_fbh *f = ffb_get_locked(bi->framebuffer, 0);
+    if (f) { fw = f->w; fh = f->h; }
+    pthread_mutex_unlock(&g_ffb_lock);
+    uint32_t aw = bi->renderArea.extent.width, ah = bi->renderArea.extent.height;
+    static uint64_t n_snap, n_same, n_far;
+    if (!fw || !fh || aw > fw || ah > fh || fw - aw >= 8 || fh - ah >= 8) {
+        if (fw && fh && __atomic_add_fetch(&n_far, 1, __ATOMIC_RELAXED) == 1)
+            VKI("[fove] area snap: eye pass area %ux%u vs framebuffer %ux%u — too far apart to widen (MoltenVK "
+                "LOADs instead of clearing; the pass may stay unfoveated)\n", aw, ah, fw, fh);
+        return bi;
+    }
+    if (aw == fw && ah == fh) {
+        if (__atomic_add_fetch(&n_same, 1, __ATOMIC_RELAXED) == 1)
+            VKI("[fove] area snap: first eye pass already covers its framebuffer (%ux%u) — nothing to widen\n", fw, fh);
+        return bi;
+    }
+    *tmp = *bi;
+    tmp->renderArea.extent.width = fw;
+    tmp->renderArea.extent.height = fh;
+    uint64_t n = __atomic_add_fetch(&n_snap, 1, __ATOMIC_RELAXED);
+    if (n == 1 || n == 1000 || n == 100000)
+        VKI("[fove] area snap #%llu: eye pass area %ux%u widened to its framebuffer %ux%u so MoltenVK clears it "
+            "instead of LOADing it (KL_FOVE_AREA_SNAP=0 turns this off)\n", (unsigned long long)n, aw, ah, fw, fh);
+    return tmp;
+}
+
+// The fove-only entry points: handed out by fove_entry() only while
+// foveation is on, so an OFF run never routes through them.
+static PFN_vkVoidFunction fove_real(const char *name, const char *alt) {
+    PFN_vkVoidFunction f = (PFN_vkVoidFunction)mvk_sym(name);
+    if (!f && alt) f = (PFN_vkVoidFunction)mvk_sym(alt);
+    return f;
+}
+// The Vulkan 1.3 / KHR_copy_commands2 spellings of the transfers (the 1.0 ones
+// are noted in klvk_CmdCopyImage / klvk_CmdBlitImage / klvk_CmdResolveImage).
+static void VKAPI_CALL klvk_CmdCopyImage2F(VkCommandBuffer cb, const VkCopyImageInfo2 *i) {
+    static PFN_vkCmdCopyImage2 real;
+    if (!real) real = (PFN_vkCmdCopyImage2)fove_real("vkCmdCopyImage2", "vkCmdCopyImage2KHR");
+    if (i && i->regionCount && i->pRegions) {
+        const VkImageCopy2 *r = i->pRegions;
+        fove_xfer_note("vkCmdCopyImage2", "copy", i->srcImage, i->dstImage, i->regionCount, &r->srcSubresource,
+                       &r->dstSubresource, r->srcOffset.x, r->srcOffset.y, r->dstOffset.x, r->dstOffset.y,
+                       r->extent.width, r->extent.height);
+    }
+    if (real) real(cb, i);
+}
+static void VKAPI_CALL klvk_CmdBlitImage2F(VkCommandBuffer cb, const VkBlitImageInfo2 *i) {
+    static PFN_vkCmdBlitImage2 real;
+    if (!real) real = (PFN_vkCmdBlitImage2)fove_real("vkCmdBlitImage2", "vkCmdBlitImage2KHR");
+    if (i && i->regionCount && i->pRegions) {
+        const VkImageBlit2 *r = i->pRegions;
+        fove_xfer_note("vkCmdBlitImage2", "blit", i->srcImage, i->dstImage, i->regionCount, &r->srcSubresource,
+                       &r->dstSubresource, r->srcOffsets[0].x, r->srcOffsets[0].y, r->dstOffsets[0].x, r->dstOffsets[0].y,
+                       (uint32_t)(r->dstOffsets[1].x - r->dstOffsets[0].x), (uint32_t)(r->dstOffsets[1].y - r->dstOffsets[0].y));
+    }
+    if (real) real(cb, i);
+}
+static void VKAPI_CALL klvk_CmdResolveImage2F(VkCommandBuffer cb, const VkResolveImageInfo2 *i) {
+    static PFN_vkCmdResolveImage2 real;
+    if (!real) real = (PFN_vkCmdResolveImage2)fove_real("vkCmdResolveImage2", "vkCmdResolveImage2KHR");
+    if (i && i->regionCount && i->pRegions) {
+        const VkImageResolve2 *r = i->pRegions;
+        fove_xfer_note("vkCmdResolveImage2", "resolve", i->srcImage, i->dstImage, i->regionCount, &r->srcSubresource,
+                       &r->dstSubresource, r->srcOffset.x, r->srcOffset.y, r->dstOffset.x, r->dstOffset.y,
+                       r->extent.width, r->extent.height);
+    }
+    if (real) real(cb, i);
+}
+
+// The indirect draws (see fove_indirect) and the execute that plays a
+// secondary carrying one.
+static void VKAPI_CALL klvk_CmdDrawIndirectF(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n,
+                                             uint32_t stride) {
+    static PFN_vkCmdDrawIndirect real;
+    if (!real) real = (PFN_vkCmdDrawIndirect)fove_real("vkCmdDrawIndirect", NULL);
+    fove_indirect(cb, "vkCmdDrawIndirect");
+    if (real) real(cb, b, o, n, stride);
+}
+static void VKAPI_CALL klvk_CmdDrawIndexedIndirectF(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n,
+                                                    uint32_t stride) {
+    static PFN_vkCmdDrawIndexedIndirect real;
+    if (!real) real = (PFN_vkCmdDrawIndexedIndirect)fove_real("vkCmdDrawIndexedIndirect", NULL);
+    fove_indirect(cb, "vkCmdDrawIndexedIndirect");
+    if (real) real(cb, b, o, n, stride);
+}
+static void VKAPI_CALL klvk_CmdDrawIndirectCountF(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkBuffer cbuf,
+                                                  VkDeviceSize co, uint32_t max, uint32_t stride) {
+    static PFN_vkCmdDrawIndirectCount real;
+    if (!real) real = (PFN_vkCmdDrawIndirectCount)fove_real("vkCmdDrawIndirectCount", "vkCmdDrawIndirectCountKHR");
+    fove_indirect(cb, "vkCmdDrawIndirectCount");
+    if (real) real(cb, b, o, cbuf, co, max, stride);
+}
+static void VKAPI_CALL klvk_CmdDrawIndexedIndirectCountF(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o,
+                                                         VkBuffer cbuf, VkDeviceSize co, uint32_t max,
+                                                         uint32_t stride) {
+    static PFN_vkCmdDrawIndexedIndirectCount real;
+    if (!real) real = (PFN_vkCmdDrawIndexedIndirectCount)fove_real("vkCmdDrawIndexedIndirectCount",
+                                                                   "vkCmdDrawIndexedIndirectCountKHR");
+    fove_indirect(cb, "vkCmdDrawIndexedIndirectCount");
+    if (real) real(cb, b, o, cbuf, co, max, stride);
+}
+static void VKAPI_CALL klvk_CmdExecuteCommandsF(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer *sec) {
+    static PFN_vkCmdExecuteCommands real;
+    if (!real) real = (PFN_vkCmdExecuteCommands)fove_real("vkCmdExecuteCommands", NULL);
+    fove_exec(cb, n, sec);
+    if (real) real(cb, n, sec);
+}
+
+// The view and framebuffer tables drop their entries with the object.
+static void VKAPI_CALL klvk_DestroyImageViewF(VkDevice dev, VkImageView v, const VkAllocationCallbacks *a) {
+    static PFN_vkDestroyImageView real;
+    if (!real && real_gdpa) real = (PFN_vkDestroyImageView)real_gdpa(dev, "vkDestroyImageView");
+    fove_forget_view(v);
+    if (real) real(dev, v, a);
+}
+static void VKAPI_CALL klvk_DestroyFramebufferF(VkDevice dev, VkFramebuffer fb, const VkAllocationCallbacks *a) {
+    static PFN_vkDestroyFramebuffer real;
+    if (!real && real_gdpa) real = (PFN_vkDestroyFramebuffer)real_gdpa(dev, "vkDestroyFramebuffer");
+    fove_forget_fb(fb);
+    if (real) real(dev, fb, a);
+}
+
+static PFN_vkVoidFunction fove_entry(const char *name) {
+    if (!name || !kl_fove_on()) return NULL;
+    static const entry fove[] = {
+        { "vkCmdCopyImage2",                  (PFN_vkVoidFunction)klvk_CmdCopyImage2F },
+        { "vkCmdCopyImage2KHR",               (PFN_vkVoidFunction)klvk_CmdCopyImage2F },
+        { "vkCmdBlitImage2",                  (PFN_vkVoidFunction)klvk_CmdBlitImage2F },
+        { "vkCmdBlitImage2KHR",               (PFN_vkVoidFunction)klvk_CmdBlitImage2F },
+        { "vkCmdResolveImage2",               (PFN_vkVoidFunction)klvk_CmdResolveImage2F },
+        { "vkCmdResolveImage2KHR",            (PFN_vkVoidFunction)klvk_CmdResolveImage2F },
+        { "vkCmdDrawIndirect",                (PFN_vkVoidFunction)klvk_CmdDrawIndirectF },
+        { "vkCmdDrawIndexedIndirect",         (PFN_vkVoidFunction)klvk_CmdDrawIndexedIndirectF },
+        { "vkCmdDrawIndirectCount",           (PFN_vkVoidFunction)klvk_CmdDrawIndirectCountF },
+        { "vkCmdDrawIndirectCountKHR",        (PFN_vkVoidFunction)klvk_CmdDrawIndirectCountF },
+        { "vkCmdDrawIndexedIndirectCount",    (PFN_vkVoidFunction)klvk_CmdDrawIndexedIndirectCountF },
+        { "vkCmdDrawIndexedIndirectCountKHR", (PFN_vkVoidFunction)klvk_CmdDrawIndexedIndirectCountF },
+        { "vkCmdExecuteCommands",             (PFN_vkVoidFunction)klvk_CmdExecuteCommandsF },
+        { "vkDestroyImageView",               (PFN_vkVoidFunction)klvk_DestroyImageViewF },
+        { "vkDestroyFramebuffer",             (PFN_vkVoidFunction)klvk_DestroyFramebufferF },
+    };
+    for (size_t i = 0; i < sizeof fove / sizeof *fove; i++)
+        if (!strcmp(name, fove[i].name)) {
+            // Only where MoltenVK has the command (either spelling): ours
+            // would otherwise drop it.
+            if (!strncmp(name, "vkCmd", 5)) {
+                char core[64];
+                snprintf(core, sizeof core, "%s", name);
+                size_t l = strlen(core);
+                if (l > 3 && !strcmp(core + l - 3, "KHR")) core[l - 3] = 0;
+                if (!fove_real(name, core)) return NULL;
+            }
+            return fove[i].fn;
+        }
+    return NULL;
+}
+
+// kl_fove swizzles MoltenVK's own MTLDevice (shader source) and command-buffer
+// classes, once, when the first device is registered — before the guest
+// compiles anything.
+static void fove_install(klvk_device *d) {
+    if (!kl_fove_on()) return;
+    typedef void (*pfn_get_mtl_device_mvk)(VkPhysicalDevice, void **);
+    pfn_get_mtl_device_mvk get_dev = (pfn_get_mtl_device_mvk)mvk_sym("vkGetMTLDeviceMVK");
+    void *mtl = NULL;
+    if (get_dev && d && d->phys) get_dev(d->phys, &mtl);
+    if (mtl) kl_fove_install(mtl);
+    else VKI("[fove] no MTLDevice behind the Vulkan device (vkGetMTLDeviceMVK) — foveation not installed\n");
+}
+
+// vkCmdBeginRenderPass[2]: the eye-pass check, and the area snap for a pass it
+// marks. Returns bi or `tmp`.
+static const VkRenderPassBeginInfo *fove_begin(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi,
+                                               VkRenderPassBeginInfo *tmp) {
+    if (fove_rp(cb, bi)) return fove_area_snap(bi, tmp);
+    return bi;
+}
+
 static const entry g_ours[] = {
 #define E(n) { "vk" #n, (PFN_vkVoidFunction)klvk_##n }
     E(CreateInstance), E(EnumerateInstanceExtensionProperties),
@@ -5960,6 +6987,8 @@ static PFN_vkVoidFunction ours(const char *name) {
                 name, hit ? "OUR wrapper" : "real MoltenVK (passthrough)");
         }
     }
+    PFN_vkVoidFunction f = fove_entry(name);   // KL_FOVEATION only (off: NULL)
+    if (f) return f;
     for (size_t i = 0; i < sizeof g_ours / sizeof *g_ours; i++)
         if (!strcmp(g_ours[i].name, name)) return g_ours[i].fn;
     return NULL;
