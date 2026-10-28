@@ -821,8 +821,15 @@ static const char *const g_plat_request[] = {
 //     the invite/roster panels read. Ownership does not enter into it, and the
 //     trailing underscore keeps this clear of ovr_GroupPresenceOptions_* below,
 //     which is a different shape entirely.
+//   ovr_CloudStorage_* — saves moved to and from Meta's cloud (Load, Save,
+//     the metadata and conflict queries). The data is not here to move, as the
+//     note at ovr_CloudStorage2_GetUserDirectoryPath says; that one keeps its
+//     own answer (the underscore after "CloudStorage" keeps it out, and the
+//     implemented names are matched first anyway). Space Pirate Trainer DX
+//     (x1663790613725314) asks LoadBucketMetadata once its start screen's
+//     timer runs out, and the refusal ended the game there (2026-10-28).
 static const char *const g_plat_request_prefix[] = {
-    "ovr_Achievements_", "ovr_GroupPresence_",
+    "ovr_Achievements_", "ovr_GroupPresence_", "ovr_CloudStorage_",
 };
 
 // ---------------------------------------------------------------------------
@@ -856,9 +863,15 @@ static const char *const g_plat_request_prefix[] = {
 //     nothing the guest can learn from the call. It is deliberately NOT filed
 //     with the enumeration-answers-none group: those state an absence, and this
 //     one is a command with no reply.
+//   ovr_Voip_SetNewConnectionOptions(ovrVoipOptionsHandle) — the options every
+//     later voice connection is made with. No voice connection is ever made
+//     here, so there is nothing for them to apply to. Space Pirate Trainer DX
+//     sets it while its start screen's hold-the-button timer runs, and the
+//     refusal ended the game there (2026-10-28).
 static const char *const g_plat_drop[] = {
     "ovr_Log_NewEvent",
     "ovr_Voip_SetMicrophoneMuted",
+    "ovr_Voip_SetNewConnectionOptions",
 };
 
 static int plat_is_drop(const char *name) {
