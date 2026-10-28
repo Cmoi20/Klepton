@@ -254,8 +254,10 @@ static uint64_t klplat_called(const char *name) {
 // `str` is the STRING payload, for the messages whose managed wrapper is a
 // `Message<string>` — it is read through ovr_Message_GetString rather than
 // through the int payload above, and a message carries one or the other.
+// `err` marks a completion that IS an error (ovr_Message_IsError): the request
+// was made and answered, and the answer is that the service is not here.
 typedef struct {
-    uint32_t type; uint64_t request; int32_t payload; const char *str;
+    uint32_t type; uint64_t request; int32_t payload; const char *str; int err;
 } klplat_msg;
 static klplat_msg      g_msgq[KLPLAT_MSGQ];
 static unsigned        g_msg_head, g_msg_tail;
@@ -272,7 +274,7 @@ static uint64_t klplat_request_str(const char *what, uint32_t type,
     uint64_t id = g_next_request++;
     if (g_msg_tail - g_msg_head < KLPLAT_MSGQ) {
         klplat_msg *m = &g_msgq[g_msg_tail++ % KLPLAT_MSGQ];
-        m->type = type; m->request = id; m->payload = payload; m->str = str;
+        m->type = type; m->request = id; m->payload = payload; m->str = str; m->err = 0;
     }
     pthread_mutex_unlock(&g_msg_mu);
     fprintf(stderr, "  [plat] %s -> request %llu, completion queued "
@@ -285,6 +287,34 @@ static uint64_t klplat_request_str(const char *what, uint32_t type,
 // ...and the int-payload spelling, which is all but one caller.
 static uint64_t klplat_request(const char *what, uint32_t type, int32_t payload) {
     return klplat_request_str(what, type, payload, NULL);
+}
+
+// ...and the failing spelling: the same request/completion pair, with the
+// completion an error. For a request whose honest answer is "no such service
+// here": the caller's callback runs and takes its own failure path, where a
+// request id of 0 would make the SDK drop the callback without ever running it.
+static uint64_t klplat_request_err(const char *what, uint32_t type) {
+    pthread_mutex_lock(&g_msg_mu);
+    uint64_t id = g_next_request++;
+    if (g_msg_tail - g_msg_head < KLPLAT_MSGQ) {
+        klplat_msg *m = &g_msgq[g_msg_tail++ % KLPLAT_MSGQ];
+        m->type = type; m->request = id; m->payload = 0; m->str = NULL; m->err = 1;
+    }
+    pthread_mutex_unlock(&g_msg_mu);
+    fprintf(stderr, "  [plat] %s -> request %llu, ERROR completion queued "
+                    "(type 0x%08x)\n", what, (unsigned long long)id, type);
+    return id;
+}
+
+// A notification: a message with request id 0, which is how the SDK tells it
+// from a reply (a reply with no waiting request is "Request with no handler").
+static void klplat_post_notification(uint32_t type) {
+    pthread_mutex_lock(&g_msg_mu);
+    if (g_msg_tail - g_msg_head < KLPLAT_MSGQ) {
+        klplat_msg *m = &g_msgq[g_msg_tail++ % KLPLAT_MSGQ];
+        m->type = type; m->request = 0; m->payload = 0; m->str = NULL; m->err = 0;
+    }
+    pthread_mutex_unlock(&g_msg_mu);
 }
 
 // The message pump. NULL still means "no messages queued", which is the
@@ -303,18 +333,38 @@ static void *klplat_PopMessage(void) {
 // on that handle. Real functions rather than named trampolines, because these
 // take the handle in x0 and a trampoline would put the entry point's NAME there.
 //
-// ovr_Message_GetError is deliberately absent: nothing here is ever an error, so
-// the guest never asks, and the fail-closed default would name it if that
-// changed. Same for every other Message accessor — a message shape we do not
-// produce should stop the run by name rather than answer.
+// Every other Message accessor is deliberately absent — a message shape we do
+// not produce should stop the run by name rather than answer.
 static uint64_t klplat_Message_GetType(const klplat_msg *m) {
     plat_hit("ovr_Message_GetType");
     return m ? m->type : 0;
 }
 static uint64_t klplat_Message_IsError(const klplat_msg *m) {
     plat_hit("ovr_Message_IsError");
+    return m ? (uint64_t)m->err : 0;
+}
+// The error handle IS the message, as the payload handle is. Every error made
+// here says the same thing, so its text is a constant.
+#define KLPLAT_ERR_NO_SERVICE \
+    "The Oculus platform service is not available on this device."
+static uint64_t klplat_Message_GetError(const klplat_msg *m) {
+    plat_hit("ovr_Message_GetError");
+    return (uint64_t)(uintptr_t)m;
+}
+static uint64_t klplat_Error_GetCode(const klplat_msg *m) {
+    plat_hit("ovr_Error_GetCode");
     (void)m;
-    return 0;
+    return 1;                     // non-zero, and no code the SDK assigns meaning to
+}
+static uint64_t klplat_Error_GetHttpCode(const klplat_msg *m) {
+    plat_hit("ovr_Error_GetHttpCode");
+    (void)m;
+    return 0;                     // no request left this machine
+}
+static const char *klplat_Error_GetMessage(const klplat_msg *m) {
+    plat_hit("ovr_Error_GetMessage");
+    (void)m;
+    return KLPLAT_ERR_NO_SERVICE;
 }
 static uint64_t klplat_Message_GetRequestID(const klplat_msg *m) {
     plat_hit("ovr_Message_GetRequestID");
@@ -1061,6 +1111,134 @@ static uint64_t klplat_JNI_OnLoad(void *vm, void *reserved) {
     return 0x00010006;                 // JNI_VERSION_1_6
 }
 
+// Leaderboards and platform voice: requests to services that are not on this
+// host. Each completes as an ERROR — what a Quest without a network says —
+// rather than as an empty or accepted board that would claim a service
+// answered, so the caller's callback runs and takes its own failure path.
+// Nothing about ownership rides on a score or a microphone. The message types
+// are the Platform SDK's own (OVR_MessageType.h), read back from IL2CPP titles
+// with KL_PROBE_ENUM=Oculus.Platform.Message/MessageType; Drop Dead: Dual
+// Strike Edition (x1935017546592600) reproduced WriteEntry and
+// GetMicrophoneAvailability in the same list. Ported from AVP Play's toolchain.
+#define KLPLAT_MSG_LEADERBOARD_GET_ENTRIES    0x5DB3474Cu // Leaderboard_GetEntries
+#define KLPLAT_MSG_LEADERBOARD_WRITE_ENTRY    0x117FC8FEu // Leaderboard_WriteEntry
+#define KLPLAT_MSG_LEADERBOARD_GET            0x6AD44EF8u // Leaderboard_Get
+#define KLPLAT_MSG_LEADERBOARD_GET_AFTER_RANK 0x18378BEFu // Leaderboard_GetEntriesAfterRank
+#define KLPLAT_MSG_LEADERBOARD_GET_BY_IDS     0x39607BFCu // Leaderboard_GetEntriesByIds
+#define KLPLAT_MSG_LEADERBOARD_WRITE_ENTRY_SM 0x72C692FAu // Leaderboard_WriteEntryWithSupplementaryMetric
+#define KLPLAT_MSG_VOIP_MIC_AVAILABILITY      0x744CE345u // Voip_GetMicrophoneAvailability
+static uint64_t klplat_Leaderboard_GetEntries(const char *name, int limit,
+                                              int filter, int start_at) {
+    (void)name; (void)limit; (void)filter; (void)start_at;
+    plat_hit("ovr_Leaderboard_GetEntries");
+    return klplat_request_err("ovr_Leaderboard_GetEntries", KLPLAT_MSG_LEADERBOARD_GET_ENTRIES);
+}
+static uint64_t klplat_Leaderboard_WriteEntry(const char *name, long long score,
+                                              const void *extra, unsigned extra_size,
+                                              int force) {
+    (void)name; (void)score; (void)extra; (void)extra_size; (void)force;
+    plat_hit("ovr_Leaderboard_WriteEntry");
+    return klplat_request_err("ovr_Leaderboard_WriteEntry", KLPLAT_MSG_LEADERBOARD_WRITE_ENTRY);
+}
+static uint64_t klplat_Leaderboard_Get(const char *name) {
+    (void)name;
+    plat_hit("ovr_Leaderboard_Get");
+    return klplat_request_err("ovr_Leaderboard_Get", KLPLAT_MSG_LEADERBOARD_GET);
+}
+static uint64_t klplat_Leaderboard_GetEntriesAfterRank(const char *name, int limit,
+                                                       unsigned long long after_rank) {
+    (void)name; (void)limit; (void)after_rank;
+    plat_hit("ovr_Leaderboard_GetEntriesAfterRank");
+    return klplat_request_err("ovr_Leaderboard_GetEntriesAfterRank",
+                              KLPLAT_MSG_LEADERBOARD_GET_AFTER_RANK);
+}
+static uint64_t klplat_Leaderboard_GetEntriesByIds(const char *name, int limit, int start_at,
+                                                   const uint64_t *user_ids, unsigned n_ids) {
+    (void)name; (void)limit; (void)start_at; (void)user_ids; (void)n_ids;
+    plat_hit("ovr_Leaderboard_GetEntriesByIds");
+    return klplat_request_err("ovr_Leaderboard_GetEntriesByIds",
+                              KLPLAT_MSG_LEADERBOARD_GET_BY_IDS);
+}
+static uint64_t klplat_Leaderboard_WriteEntryWithSupplementaryMetric(
+        const char *name, long long score, long long metric,
+        const void *extra, unsigned extra_size, int force) {
+    (void)name; (void)score; (void)metric; (void)extra; (void)extra_size; (void)force;
+    plat_hit("ovr_Leaderboard_WriteEntryWithSupplementaryMetric");
+    return klplat_request_err("ovr_Leaderboard_WriteEntryWithSupplementaryMetric",
+                              KLPLAT_MSG_LEADERBOARD_WRITE_ENTRY_SM);
+}
+static uint64_t klplat_Voip_GetMicrophoneAvailability(void) {
+    plat_hit("ovr_Voip_GetMicrophoneAvailability");
+    return klplat_request_err("ovr_Voip_GetMicrophoneAvailability",
+                              KLPLAT_MSG_VOIP_MIC_AVAILABILITY);
+}
+
+// Drop Dead: Dual Strike Edition (x1935017546592600) asks ovr_Room_GetCurrent at
+// start (does the player already sit in a room?) and
+// ovr_Voip_SetSystemVoipSuppressed after its leaderboard writes; refused, its
+// loading screen stopped after "Fetched Title News" and never moved on (on
+// device, 2026-10-28, frame loop running, every thread parked). Both type
+// values were read out of the title's running IL2CPP runtime with KL_PROBE_ENUM.
+#define KLPLAT_MSG_ROOM_GET_CURRENT           0x09A6A504u // Room_GetCurrent
+#define KLPLAT_MSG_VOIP_SET_SYSTEM_SUPPRESSED 0x453FC9AAu // Voip_SetSystemVoipSuppressed
+// Its boot waits on ApplicationLaunchManager.AssessCoordinatedLaunch, which loops
+// until PTSocialPlatformController_Oculus.HasCheckedLaunchState. Read from the
+// game's IL2CPP code, that flag is set by exactly one path that matters here:
+// the Rooms.GetCurrent completion, and only when it is NOT an error and carries
+// a Room that is not in state 4 and has no users (the error branch leaves
+// without ever checking the launch state). The honest answer for "the player is
+// in no room" is therefore a successful completion carrying an empty Room whose
+// every field reads as absent (see plat_is_room_field). Nobody is reported to be
+// in a room, so no multiplayer path starts; ownership plays no part. Every
+// other title keeps the refusal it had.
+static int plat_is_request(const char *name);
+static uint64_t klplat_init_fails(const char *name);
+static int klplat_room_empty_ok(void) {
+    const char *t = kl_driver_target_name();
+    return t && strcmp(t, "x1935017546592600") == 0;
+}
+// ...and the second thing the same boot waits on. DeepLinkHelper.Ready, which
+// VrBootManager.LoadScene polls before it loads anything, is only ever raised by
+// the callback the game registers for
+// Notification_ApplicationLifecycle_LaunchIntentChanged (0x04b34ca3, read out of
+// the running game with KL_PROBE_ENUM). The real platform posts that
+// notification once when an app starts; here nothing did, so the logo never went
+// away. For a normal launch the callback only logs the message, reads the launch
+// details (started normally, nothing attached) and raises Ready.
+#define KLPLAT_MSG_LAUNCH_INTENT_CHANGED 0x04B34CA3u
+static uint64_t klplat_Room_GetCurrent(void) {
+    plat_hit("ovr_Room_GetCurrent");
+    if (!klplat_room_empty_ok()) return klplat_init_fails("ovr_Room_GetCurrent");
+    static int posted;
+    if (!posted) {
+        posted = 1;
+        klplat_post_notification(KLPLAT_MSG_LAUNCH_INTENT_CHANGED);
+        fprintf(stderr, "  [plat] posted Notification_ApplicationLifecycle_LaunchIntentChanged "
+                        "(launched normally, nothing attached)\n");
+    }
+    return klplat_request("ovr_Room_GetCurrent", KLPLAT_MSG_ROOM_GET_CURRENT, 0);
+}
+// The empty Room's fields, and its DataStore: all absent (0 = zero ID, NULL
+// string/list, zero enum). Only reachable for the target above, because only it
+// is handed a Room handle; the requests of the family stay requests.
+static int plat_is_room_field(const char *name) {
+    if (!klplat_room_empty_ok()) return 0;
+    if (strncmp(name, "ovr_DataStore_", 14) == 0) return 1;
+    return strncmp(name, "ovr_Room_Get", 12) == 0 && !plat_is_request(name);
+}
+static uint64_t klplat_room_field(const char *name) {
+    plat_hit(name);
+    return 0;
+}
+static uint64_t klplat_Voip_SetSystemVoipSuppressed(int suppressed) {
+    (void)suppressed;
+    plat_hit("ovr_Voip_SetSystemVoipSuppressed");
+    if (!klplat_room_empty_ok())          // this title only; others: as before
+        return klplat_init_fails("ovr_Voip_SetSystemVoipSuppressed");
+    return klplat_request_err("ovr_Voip_SetSystemVoipSuppressed",
+                              KLPLAT_MSG_VOIP_SET_SYSTEM_SUPPRESSED);
+}
+
 // ovr_Net_ReadPacket() — the peer-to-peer network's receive poll. It returns an
 // ovrPacketHandle, and NULL is the SDK's own "no packet waiting". There is no
 // peer on this host (the platform service is absent, so no room can be joined
@@ -1132,6 +1310,22 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     // behind ours that it is not already holding.
     {"ovr_Message_GetNativeMessage", (void *)klplat_Message_GetPayload},
     {"ovr_Message_IsError",       (void *)klplat_Message_IsError},
+    {"ovr_Message_GetError",      (void *)klplat_Message_GetError},
+    {"ovr_Error_GetCode",         (void *)klplat_Error_GetCode},
+    {"ovr_Error_GetHttpCode",     (void *)klplat_Error_GetHttpCode},
+    {"ovr_Error_GetMessage",      (void *)klplat_Error_GetMessage},
+    {"ovr_Error_GetDisplayableMessage", (void *)klplat_Error_GetMessage},
+    {"ovr_Message_GetRoom",       (void *)klplat_Message_GetPayload},
+    {"ovr_Leaderboard_GetEntries",          (void *)klplat_Leaderboard_GetEntries},
+    {"ovr_Leaderboard_WriteEntry",          (void *)klplat_Leaderboard_WriteEntry},
+    {"ovr_Leaderboard_Get",                 (void *)klplat_Leaderboard_Get},
+    {"ovr_Leaderboard_GetEntriesAfterRank", (void *)klplat_Leaderboard_GetEntriesAfterRank},
+    {"ovr_Leaderboard_GetEntriesByIds",     (void *)klplat_Leaderboard_GetEntriesByIds},
+    {"ovr_Leaderboard_WriteEntryWithSupplementaryMetric",
+                                  (void *)klplat_Leaderboard_WriteEntryWithSupplementaryMetric},
+    {"ovr_Voip_GetMicrophoneAvailability",  (void *)klplat_Voip_GetMicrophoneAvailability},
+    {"ovr_Room_GetCurrent",                 (void *)klplat_Room_GetCurrent},
+    {"ovr_Voip_SetSystemVoipSuppressed",    (void *)klplat_Voip_SetSystemVoipSuppressed},
     {"ovr_Message_GetRequestID",  (void *)klplat_Message_GetRequestID},
     {"ovr_Message_GetPlatformInitialize",      (void *)klplat_Message_GetPayload},
     {"ovr_PlatformInitialize_GetResult",       (void *)klplat_payload_int},
@@ -1190,6 +1384,8 @@ void *kl_ovrplat_sym(const char *name) {
         return kl_named_stub(name, (void *)klplat_launch_field);
     if (plat_is_empty_array(name))
         return kl_named_stub(name, (void *)klplat_empty_array);
+    if (plat_is_room_field(name))
+        return kl_named_stub(name, (void *)klplat_room_field);
     if (plat_is_options_sink(name))
         return kl_named_stub(name, (void *)klplat_void);
     if (plat_is_init_async(name))
