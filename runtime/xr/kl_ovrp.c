@@ -1273,8 +1273,13 @@ static const float *klovrp_forced_tan(void) {
 // composite reproject, one symmetric union cone per eye — they agree, the cross
 // is gone, at the known cost of the union's slightly lower angular density. The
 // env still overrides in either direction.
+//
+// Contractors (x2436897736439055, UE 4.27 Oculus) is the same shape by Meta's
+// symmetric projection: its 3379-wide eye becomes a 4224 texture (x1.25), and
+// `render viewport: eye0 0,0 4224x2710 eye1 0,0 4224x2710`. On device each eye
+// alone looked right and the two together did not overlay (2026-10-28).
 static int klovrp_unify_default(void) {
-    static const char *on[] = { "intotheradius" };
+    static const char *on[] = { "intotheradius", "x2436897736439055" };
     const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;

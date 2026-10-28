@@ -1030,7 +1030,9 @@ puts the camera on the ground with its hands underneath it.
   its horizontal pixels. Renders correctly on device with it **off**
   (2026-08-13, user-confirmed), so 1 is now purely the A/B — and the answer for
   any guest ever found that collapses the cones without submitting per-eye
-  rects, which would be unservable any other way.
+  rects, which would be unservable any other way. Default on for Into The
+  Radius and Contractors (`x2436897736439055`, UE 4.27, which widens its eye
+  texture for Meta's symmetric projection and submits both eyes full width).
 - `KL_VRR` — **foveated guest rendering** (host: `tests/t_mtl_provider.m`;
   device: `KleptonCompositor.swift`). **On by default**; `KL_VRR=0` is the A/B.
   Builds an `MTLRasterizationRateMap` for the eye size and hands it to

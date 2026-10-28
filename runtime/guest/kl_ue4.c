@@ -84,6 +84,15 @@ static const char *const UE4_CHAIN[] = {
     "libfmodstudio.so",
     "libovraudio64.so",     // the Oculus audio spatializer
     "libplaycore.so",       // Google Play core — the OBB downloader's half
+    // Vivox voice chat, the same case as FMOD: libUE4 binds its vx_* imports
+    // against it. Contractors (x2436897736439055) ships it beside libUE4.
+    "libvivox-sdk.so",
+    // Heroic Labs' Nakama client (its C API: createDefaultNakamaClient,
+    // NClient_*, NSession_*), the same case once more: libUE4 binds against it,
+    // and Contractors aborted on createDefaultNakamaClient as unresolved right
+    // after the platform check (2026-10-28). Built on libc++_shared, so after
+    // it; skipped where a guest does not ship it.
+    "libnakama-cpp.so",
     UE4_LIB,
 };
 
