@@ -143,7 +143,29 @@ static klj_val klj_SB_append_S(void *env, void *self, const klj_val *a, int n) {
     return (klj_val){.l = self};
 }
 
+// What a guest that caught one of klj_raise()'s exceptions asks of it: Unity
+// logs `toString()` and keeps `getMessage()`. "<dotted class>: <message>", as
+// Throwable.toString prints it.
+static klj_val klj_Throwable_toString(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    if (!o) return (klj_val){.l = NULL};
+    const char *msg = klj_throwable_message(self);
+    char buf[1400];
+    snprintf(buf, sizeof buf, "%s%s%s", o->cls, msg && *msg ? ": " : "", msg ? msg : "");
+    for (char *c = buf; *c && *c != ':'; c++) if (*c == '/') *c = '.';
+    return (klj_val){.l = kl_jni_new_string(buf)};
+}
+static klj_val klj_Throwable_getMessage(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    const char *msg = klj_throwable_message(self);
+    return (klj_val){.l = msg ? kl_jni_new_string(msg) : NULL};
+}
+
 const klj_binding klj_bind_lang[] = {
+
+    {"java/lang/Throwable", "toString",   "()Ljava/lang/String;", klj_Throwable_toString},
+    {"java/lang/Throwable", "getMessage", "()Ljava/lang/String;", klj_Throwable_getMessage},
 
     {"java/lang/Class", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
     {"java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", klj_Class_forName},

@@ -164,6 +164,27 @@ static int klj_zip_data_off(const klj_zip *z, const klj_zent *e, uint64_t *out) 
     return 0;
 }
 
+// Whether `new ZipFile(<missing>)` THROWS, as Java's does, or only answers
+// null, as this file always has. Unity reads the main OBB's GUID, then tries
+// patch.<code>.<package>.obb and keeps that one's GUID unless the constructor
+// throws FileNotFoundException — so on null it compares '' with the APK's GUID
+// and never gets past "Application OBB has mismatching GUID ... got ''" for a
+// title that ships a main OBB and no patch OBB: Pistol Whip (x2104963472963790,
+// black screen) and Drop Dead: Dual Strike Edition (x1935017546592600, on its
+// logo). Per target, because no other row has been run with a throwing
+// constructor; KL_JNI_ZIP_THROW=1/0 forces it either way for trying another title.
+static int klj_zip_throws(void) {
+    static int v = -1;
+    if (v < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        int dflt = t && (strcmp(t, "x2104963472963790") == 0    // Pistol Whip
+                      || strcmp(t, "x1935017546592600") == 0);  // Drop Dead: Dual Strike
+        v = kl_env_on("KL_JNI_ZIP_THROW", dflt);
+    }
+    return v;
+}
+
 static klj_val klj_ZipFile_init(void *env, void *clazz, const klj_val *a, int n) {
     (void)env; (void)clazz;
     const char *path = n > 0 ? klj_str(a[0].l) : NULL;
@@ -171,8 +192,12 @@ static klj_val klj_ZipFile_init(void *env, void *clazz, const klj_val *a, int n)
     klj_zip *z = calloc(1, sizeof *z);
     if (!z) return (klj_val){.l = NULL};
     if (klj_zip_open(z, path) != 0) {
+        int missing = !z->f;
         if (z->f) fclose(z->f);
         free(z->e); free(z);
+        if (klj_zip_throws())
+            klj_raise(missing ? "java/io/FileNotFoundException" : "java/util/zip/ZipException",
+                      path);
         return (klj_val){.l = NULL};      // guest catches IOException
     }
     void *obj = kl_jni_new_object("java/util/zip/ZipFile");

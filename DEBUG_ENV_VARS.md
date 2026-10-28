@@ -546,6 +546,14 @@ The guest's own memory management, and the three seams that used to disable it.
   SUPERHOT's save loader chains its whole load off this one request, so a
   refusal leaves the SDK waiting on a completion that never comes, behind the
   launch precache's own black clear.
+- `KL_JNI_ZIP_THROW=0|1` (`runtime/jni/kl_jni_io.c`) — `new ZipFile(<path>)`
+  on a missing or unreadable archive throws `FileNotFoundException` /
+  `ZipException` (a pending exception, `klj_raise` in `runtime/kl_jni.c`)
+  instead of only answering null. Unity's OBB check keeps a patch OBB's GUID
+  unless that constructor throws, so a title that ships a main OBB and no patch
+  OBB stops on "Application OBB has mismatching GUID ... got ''". Default 1 for
+  Pistol Whip (`x2104963472963790`) and Drop Dead: Dual Strike Edition
+  (`x1935017546592600`), else 0.
 
 ## Device identity (`runtime/kl_jni.c`)
 

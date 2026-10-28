@@ -477,10 +477,70 @@ void *kl_jni_class(const char *name) { return klj_FindClass(NULL, name); }
     return c;
 }
 
-static void *klj_ExceptionOccurred(void *env) { (void)env; return NULL; }
-static void  klj_ExceptionDescribe(void *env) { (void)env; }
-static void  klj_ExceptionClear(void *env)    { (void)env; }
- kl_jint klj_ExceptionCheck(void *env)  { (void)env; return 0; }
+// Pending Java exceptions, per thread as in a real VM. Almost nothing raises
+// one: a missing answer here has always been a NULL return, and that stays the
+// rule. klj_raise() is for the few calls whose THROW is the answer the guest
+// reads — Unity's OBB GUID check learns that patch.<code>.<package>.obb is
+// absent only from `new ZipFile()` throwing FileNotFoundException; with no
+// exception it takes the "patch exists" branch, reads its GUID as '' over the
+// main OBB's good one, and stops on "Application OBB has mismatching GUID".
+// With nothing raised these are exactly the old constants.
+static __thread klj_object *t_pending_exc;
+
+static void klj_set_pending(klj_object *e) {
+    pthread_mutex_lock(&g_lock);
+    if (e) e->pinned++;                 // lives until ExceptionClear, not a frame pop
+    klj_object *old = t_pending_exc;
+    t_pending_exc = e;
+    if (old && old->pinned) old->pinned--;
+    pthread_mutex_unlock(&g_lock);
+}
+
+void klj_raise(const char *cls, const char *msg) {
+    // The message rides in the object, for Throwable.getMessage/toString: the
+    // guest logs what it caught (Unity calls toString on it straight away).
+    klj_set_pending(klj_as_object(klj_own(klj_new_object_data(cls, strdup(msg ? msg : "")), free)));
+    KLJ_LOG("throw %s: %s", cls, msg ? msg : "");
+}
+
+// The guest's own throws. Unity catches what klj_raise() threw, logs it, and
+// hands it on with Throw — for its caller to catch — so these set the same
+// per-thread state. Both return 0 (JNI_OK).
+static kl_jint klj_Throw(void *env, void *obj) {
+    (void)env;
+    klj_object *e = klj_as_object(obj);
+    if (!e) return -1;
+    KLJ_LOG("Throw %s (from the guest)", e->cls);
+    klj_set_pending(e);
+    return 0;
+}
+static kl_jint klj_ThrowNew(void *env, void *clazz, const char *msg) {
+    (void)env;
+    const char *cls = klj_class_name(clazz);
+    klj_object *e = klj_as_object(klj_own(klj_new_object_data(cls, strdup(msg ? msg : "")), free));
+    if (!e) return -1;
+    KLJ_LOG("ThrowNew %s: %s (from the guest)", cls, msg ? msg : "");
+    klj_set_pending(e);
+    return 0;
+}
+
+static void *klj_ExceptionOccurred(void *env) { (void)env; return t_pending_exc; }
+static void  klj_ExceptionClear(void *env) {
+    (void)env;
+    klj_object *e = t_pending_exc;
+    if (!e) return;
+    t_pending_exc = NULL;
+    pthread_mutex_lock(&g_lock);
+    if (e->pinned) e->pinned--;
+    pthread_mutex_unlock(&g_lock);
+    KLJ_LOG("exception %s cleared by the guest", e->cls);
+}
+// Java's ExceptionDescribe prints and clears.
+static void  klj_ExceptionDescribe(void *env) {
+    if (t_pending_exc) KLJ_LOG("ExceptionDescribe: %s", t_pending_exc->cls);
+    klj_ExceptionClear(env);
+}
+ kl_jint klj_ExceptionCheck(void *env)  { (void)env; return t_pending_exc != NULL; }
 
 static __attribute__((noreturn)) void klj_FatalError(void *env, const char *msg) {
     (void)env;
@@ -618,6 +678,12 @@ static const struct { const char *cls, *super; } g_supers[] = {
     // objects actually are — which is also what makes IsInstanceOf answer
     // correctly for a guest that checks.
     {"java/security/cert/X509Certificate",     "java/security/cert/Certificate"},
+    // What klj_raise() throws, so a guest that catches the base class (or asks
+    // IsInstanceOf IOException) recognises it.
+    {"java/io/FileNotFoundException",          "java/io/IOException"},
+    {"java/util/zip/ZipException",             "java/io/IOException"},
+    {"java/io/IOException",                    "java/lang/Exception"},
+    {"java/lang/Exception",                    "java/lang/Throwable"},
     {NULL, NULL},
 };
 
@@ -635,6 +701,14 @@ static int klj_class_extends(const char *sub, const char *want) {
         cur = next;
     }
     return 0;
+}
+
+// The message of an exception klj_raise() or ThrowNew made, or NULL for any
+// other object.
+const char *klj_throwable_message(void *obj) {
+    klj_object *o = klj_as_object(obj);
+    if (!o || !o->data) return NULL;
+    return klj_class_extends(o->cls, "java/lang/Throwable") ? (const char *)o->data : NULL;
 }
 
 static kl_jint klj_IsInstanceOf(void *env, void *obj, void *clazz) {
@@ -2146,6 +2220,8 @@ static void klj_build_tables(void) {
     ENV(GetVersion,           klj_GetVersion);
     ENV(FindClass,            klj_FindClass);
     ENV(GetObjectClass,       klj_GetObjectClass);
+    ENV(Throw,                klj_Throw);
+    ENV(ThrowNew,             klj_ThrowNew);
     ENV(ExceptionOccurred,    klj_ExceptionOccurred);
     ENV(ExceptionDescribe,    klj_ExceptionDescribe);
     ENV(ExceptionClear,       klj_ExceptionClear);

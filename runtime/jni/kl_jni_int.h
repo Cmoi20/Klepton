@@ -148,6 +148,8 @@ void       *klj_want(void *clazz, const char *name, const char *sig, char kind);
 klj_val     klj_call(void *env, void *self, void *mid, kl_va *va, char want);
 void        klj_field_store(void *obj, void *fid, klj_val v);
 kl_jint     klj_ExceptionCheck(void *env);
+void        klj_raise(const char *cls, const char *msg);   // pending exception for the guest
+const char *klj_throwable_message(void *obj);              // NULL unless klj_raise/ThrowNew made it
 void       *klj_GetObjectClass(void *env, void *obj);
 kl_jint     klj_PushLocalFrame(void *env, kl_jint cap);
 void       *klj_PopLocalFrame(void *env, void *result);
