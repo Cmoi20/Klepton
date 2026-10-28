@@ -1061,8 +1061,22 @@ static uint64_t klplat_JNI_OnLoad(void *vm, void *reserved) {
     return 0x00010006;                 // JNI_VERSION_1_6
 }
 
+// ovr_Net_ReadPacket() — the peer-to-peer network's receive poll. It returns an
+// ovrPacketHandle, and NULL is the SDK's own "no packet waiting". There is no
+// peer on this host (the platform service is absent, so no room can be joined
+// and no connection can exist), so NULL is the true answer, not a made-up one.
+// Drop Dead: Dual Strike Edition (x1935017546592600) polls it from its network
+// update once the platform is up and the run ended there by name (on device).
+// Nothing about ownership rides on it. The packet accessors (ovr_Packet_*) read
+// a handle only a non-NULL answer could hand out, so they are never reached.
+static uint64_t klplat_Net_ReadPacket(void) {
+    plat_hit("ovr_Net_ReadPacket");
+    return 0;
+}
+
 static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"JNI_OnLoad",                (void *)klplat_JNI_OnLoad},
+    {"ovr_Net_ReadPacket",        (void *)klplat_Net_ReadPacket},
     {"ovr_IsPlatformInitialized", (void *)klplat_IsPlatformInitialized},
     {"ovr_GetLoggedInUserID",     (void *)klplat_GetLoggedInUserID},
     {"ovr_GetLoggedInUserLocale", (void *)klplat_GetLoggedInUserLocale},
